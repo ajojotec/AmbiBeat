@@ -567,16 +567,18 @@ def test_invalid_saved_lighting_color_mode_is_ignored():
             assert MODULE._load_app_settings() == {}
 
 
-def test_christmas_lighting_mode_is_saved_loaded_and_rolled_back(tmp_path, monkeypatch):
+@pytest.mark.parametrize("mode", ["christmas", "gelato"])
+def test_builtin_lighting_mode_is_saved_loaded_and_rolled_back(mode, tmp_path, monkeypatch):
     path = tmp_path / "settings.json"
     monkeypatch.setattr(MODULE, "APP_SETTINGS_PATH", str(path))
     monkeypatch.setattr(MODULE, "LEGACY_APP_SETTINGS_PATH", str(tmp_path / "legacy.json"))
     backend = MODULE.AmbiBeatBackend.__new__(MODULE.AmbiBeatBackend)
     backend.lighting_color_mode = "artwork"
+    backend.custom_palettes = []
     backend._save_settings = lambda: MODULE._write_app_settings(
         {"lighting_color_mode": backend.lighting_color_mode})
-    backend.update_setting("lighting-color-mode", "christmas")
-    assert MODULE._load_app_settings()["lighting_color_mode"] == "christmas"
+    backend.update_setting("lighting-color-mode", mode)
+    assert MODULE._load_app_settings()["lighting_color_mode"] == mode
     with pytest.raises(ValueError):
         backend.update_setting("lighting-color-mode", "invalid")
 
@@ -585,7 +587,7 @@ def test_christmas_lighting_mode_is_saved_loaded_and_rolled_back(tmp_path, monke
     backend._save_settings = fail_save
     with pytest.raises(OSError, match="disk full"):
         backend.update_setting("lighting-color-mode", "rainbow")
-    assert backend.lighting_color_mode == "christmas"
+    assert backend.lighting_color_mode == mode
 
 
 @pytest.mark.parametrize("setting,valid", [
@@ -690,6 +692,7 @@ def test_state_exposes_selected_and_resolved_rotation_direction():
     backend.edge_swirl = True
     backend.lighting_mode = "disco"
     backend.lighting_color_mode = "rainbow"
+    backend.custom_palettes = []
     backend.disco_light_style = "bulb"
     backend.disco_wire_color = "theme"
     backend.disco_light_count = 12

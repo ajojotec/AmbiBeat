@@ -4,16 +4,21 @@ import os
 import re
 import sys
 
-from PySide6.QtCore import QPointF, QSettings, QSignalBlocker, QStandardPaths, Qt, Signal
-from PySide6.QtGui import QColor, QIcon, QPainter, QPen
+from PySide6.QtCore import QPointF, QSettings, QSignalBlocker, QSize, QStandardPaths, Qt, Signal
+from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
+    QColorDialog,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QPushButton,
     QScrollArea,
     QSlider,
+    QStackedWidget,
     QStyle,
     QStyleOptionButton,
     QVBoxLayout,
@@ -21,9 +26,16 @@ from PySide6.QtWidgets import (
 )
 
 from .backend import (
+    CUSTOM_PALETTE_LIMIT,
     SOURCE_PROMPT_SECONDS_DEFAULT,
     SOURCE_PROMPT_SECONDS_MAX,
     SOURCE_PROMPT_SECONDS_MIN,
+    normalize_custom_palettes,
+)
+
+LIGHTING_COLOR_OPTIONS = (
+    ("artwork", "Artwork colours"), ("rainbow", "Rainbow"),
+    ("christmas", "Christmas"), ("gelato", "Gelato"),
 )
 
 
@@ -112,13 +124,230 @@ class PanelCheckBox(QCheckBox):
                          QPointF(rect.left() + rect.width() * .78, rect.top() + rect.height() * .30))
 
 
+def palette_action_icon(kind):
+    pixmap = QPixmap(20, 20)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    pen = QPen(QColor("#f5f8ff"), 2)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    painter.setPen(pen)
+    if kind == "save":
+        painter.drawRoundedRect(3, 3, 14, 14, 1, 1)
+        painter.drawLine(6, 3, 6, 8)
+        painter.drawLine(6, 8, 14, 8)
+        painter.drawLine(14, 8, 14, 3)
+        painter.drawLine(6, 13, 14, 13)
+    elif kind == "cancel":
+        painter.drawLine(5, 5, 15, 15)
+        painter.drawLine(15, 5, 5, 15)
+    elif kind == "choose":
+        painter.drawLine(4, 16, 6, 12)
+        painter.drawLine(6, 12, 12, 6)
+        painter.drawLine(8, 14, 14, 8)
+        painter.drawLine(6, 12, 8, 14)
+        painter.drawLine(12, 6, 14, 8)
+        painter.drawLine(11, 5, 15, 9)
+        painter.drawLine(14, 3, 17, 6)
+    elif kind == "remove":
+        painter.drawLine(5, 6, 15, 6)
+        painter.drawLine(8, 3, 12, 3)
+        painter.drawLine(6, 8, 7, 17)
+        painter.drawLine(14, 8, 13, 17)
+        painter.drawLine(7, 17, 13, 17)
+        painter.drawLine(10, 9, 10, 14)
+    painter.end()
+    return QIcon(pixmap)
+
+
+class CustomPaletteDialog(QDialog):
+    def __init__(self, palettes, save, capture, parent=None, artwork_colors=None):
+        saved = {palette["slot"]: palette for palette in palettes}
+        empty = -1
+        if artwork_colors is not None:
+            empty = next((index for index in range(CUSTOM_PALETTE_LIMIT) if index + 1 not in saved), -1)
+            if empty < 0:
+                raise ValueError("All eight palette slots are in use; clear one before saving artwork colours")
+        super().__init__(parent)
+        self.setWindowTitle("Custom palettes")
+        self.setModal(True)
+        self.setStyleSheet("""
+            QDialog { background: #070e27; }
+            QLineEdit { background: #070e27; color: white; border: 1px solid #718cc1;
+                        border-radius: 6px; padding: 6px; }
+            QLabel#paletteStatus { color: #ffb6a8; }
+            QDialog QPushButton { background: #0a183a; color: #f5f8ff; min-width: 0; min-height: 0;
+                border: 1px solid #718cc1; border-radius: 6px; padding: 8px 12px; }
+            QDialog QPushButton:hover { background: #183567; }
+        """)
+        self.save_palettes = save
+        self.capture_palette = capture
+        self.slots = []
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Choose a palette slot"))
+        self.slot_selector = WheelIgnoringComboBox()
+        self.slot_selector.setAccessibleName("Palette slot")
+        layout.addWidget(self.slot_selector)
+        self.stack = QStackedWidget()
+        layout.addWidget(self.stack, 1)
+        for slot in range(1, CUSTOM_PALETTE_LIMIT + 1):
+            page = QWidget()
+            page_layout = QVBoxLayout(page)
+            page_layout.setContentsMargins(0, 0, 0, 0)
+            name = QLineEdit()
+            name.setAccessibleName(f"Palette {slot} name")
+            name.setPlaceholderText("Palette name")
+            name_label = QLabel("Name")
+            name_label.setBuddy(name)
+            page_layout.addWidget(name_label)
+            page_layout.addWidget(name)
+            enabled = PanelCheckBox("Show in lighting colours")
+            enabled.setChecked(True)
+            page_layout.addWidget(enabled)
+            page_layout.addWidget(QLabel("Enter 2–8 colours; leave unused fields empty."))
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            content = QWidget()
+            colors_layout = QVBoxLayout(content)
+            colors_layout.setContentsMargins(0, 0, 0, 0)
+            rows, inputs = [], []
+            for index in range(8):
+                row = QWidget()
+                row_layout = QHBoxLayout(row)
+                row_layout.setContentsMargins(0, 0, 0, 0)
+                field = QLineEdit()
+                field.setAccessibleName(f"Palette {slot} colour {index + 1}")
+                field.setPlaceholderText("#rrggbb")
+                choose = QPushButton()
+                choose.setIcon(palette_action_icon("choose"))
+                choose.setIconSize(QSize(20, 20))
+                choose.setToolTip("Choose colour...")
+                choose.setAccessibleName(f"Choose palette {slot} colour {index + 1}")
+                choose.clicked.connect(lambda _checked=False, target=field: self.choose_color(target))
+                remove = QPushButton()
+                remove.setIcon(palette_action_icon("remove"))
+                remove.setIconSize(QSize(20, 20))
+                remove.setToolTip("Remove colour")
+                remove.setAccessibleName(f"Remove palette {slot} colour {index + 1}")
+                remove.setEnabled(False)
+                field.textChanged.connect(lambda text, button=remove: button.setEnabled(bool(text.strip())))
+                remove.clicked.connect(
+                    lambda _checked=False, slot_index=slot - 1, color_index=index:
+                    self.remove_color(slot_index, color_index))
+                row_layout.addWidget(field, 1)
+                row_layout.addWidget(choose)
+                row_layout.addWidget(remove)
+                colors_layout.addWidget(row)
+                rows.append(row)
+                inputs.append(field)
+            colors_layout.addStretch()
+            scroll.setWidget(content)
+            page_layout.addWidget(scroll, 1)
+            buttons = QHBoxLayout()
+            capture_button = QPushButton("Capture current palette")
+            clear = QPushButton("Clear palette")
+            capture_button.clicked.connect(
+                lambda _checked=False, index=slot - 1: self.capture_colors(index))
+            clear.clicked.connect(lambda _checked=False, index=slot - 1: self.clear_slot(index))
+            buttons.addWidget(capture_button)
+            buttons.addWidget(clear)
+            page_layout.addLayout(buttons)
+            self.stack.addWidget(page)
+            self.slot_selector.addItem(f"Slot {slot}", slot)
+            self.slots.append({"name": name, "enabled": enabled, "rows": rows, "inputs": inputs})
+            name.textChanged.connect(lambda text, index=slot - 1: self.update_slot_label(index, text))
+            if slot in saved:
+                palette = saved[slot]
+                name.setText(palette["name"])
+                enabled.setChecked(palette["enabled"])
+                self.set_colors(slot - 1, palette["colors"])
+            else:
+                self.set_colors(slot - 1, [])
+        self.slot_selector.currentIndexChanged.connect(self.stack.setCurrentIndex)
+        self.status = QLabel()
+        self.status.setObjectName("paletteStatus")
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Save).setIcon(palette_action_icon("save"))
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setIcon(palette_action_icon("cancel"))
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.resize(540, 520)
+        if artwork_colors is not None:
+            self.slot_selector.setCurrentIndex(empty)
+            self.set_colors(empty, artwork_colors)
+
+    def update_slot_label(self, index, text):
+        self.slot_selector.setItemText(index, f"Slot {index + 1}" + (f" - {text.strip()}" if text.strip() else ""))
+
+    def set_colors(self, index, colors):
+        slot = self.slots[index]
+        for color_index, field in enumerate(slot["inputs"]):
+            field.setText(colors[color_index] if color_index < len(colors) else "")
+
+    def remove_color(self, index, color_index):
+        slot = self.slots[index]
+        colors = [field.text() for field in slot["inputs"]]
+        colors.pop(color_index)
+        self.set_colors(index, colors)
+
+    def clear_slot(self, index):
+        slot = self.slots[index]
+        slot["name"].clear()
+        slot["enabled"].setChecked(True)
+        self.set_colors(index, [])
+        self.status.clear()
+
+    def capture_colors(self, index):
+        try:
+            if self.capture_palette is None:
+                raise ValueError("Current palette capture is unavailable")
+            colors = self.capture_palette()
+            if not 2 <= len(colors) <= 8:
+                raise ValueError("The current palette does not contain two to eight colours")
+        except (OSError, ValueError, RuntimeError) as error:
+            self.status.setText(f"Palette could not be captured: {error}")
+            return
+        self.set_colors(index, colors)
+        self.status.clear()
+
+    def choose_color(self, field):
+        initial = QColor(field.text())
+        chosen = QColorDialog.getColor(initial if initial.isValid() else QColor("white"), self,
+                                       "Choose colour")
+        if chosen.isValid():
+            field.setText(chosen.name())
+
+    def accept(self):
+        palettes = []
+        for index, slot in enumerate(self.slots):
+            name = slot["name"].text()
+            colors = [field.text().strip() for field in slot["inputs"] if field.text().strip()]
+            if not name.strip() and not colors:
+                continue
+            palettes.append({"slot": index + 1, "name": name, "colors": colors,
+                             "enabled": slot["enabled"].isChecked()})
+        try:
+            palettes = normalize_custom_palettes(palettes)
+            self.save_palettes(palettes)
+        except (OSError, ValueError, RuntimeError) as error:
+            self.status.setText(f"Palettes could not be saved: {error}")
+            return
+        super().accept()
+
+
 class SidePanel(QWidget):
     close_requested = Signal()
 
-    def __init__(self, state, kind, modes, request, parent=None):
+    def __init__(self, state, kind, modes, request, parent=None, capture_palette=None):
         super().__init__(parent)
         self.kind = kind
         self.request = request
+        self.capture_palette = capture_palette
+        self.custom_palettes = state.get("customPalettes", [])
         self.fields = {}
         self.committed = {}
         self.slider_outputs = {}
@@ -356,6 +585,10 @@ class SidePanel(QWidget):
             self.resetting = False
 
     def sync_fields(self, state):
+        if "customPalettes" in state:
+            self.custom_palettes = state["customPalettes"]
+            if self.kind == "visual":
+                self.update_palette_items(state.get("lightingColorMode", "artwork"))
         for key, (widget, _default, _path) in self.fields.items():
             if key not in state or (isinstance(widget, QSlider) and widget.isSliderDown()):
                 continue
@@ -405,11 +638,18 @@ class SidePanel(QWidget):
         ], state.get("lightingMode", "border"))
         self.bind("lightingMode", self.lighting_mode, "border", "lighting-mode",
                   self.lighting_mode.currentData())
-        self.lighting_color_mode = self.combo("Lighting colours", [
-            ("artwork", "Artwork colours"), ("rainbow", "Rainbow"), ("christmas", "Christmas"),
-        ], state.get("lightingColorMode", "artwork"))
+        palette_options = list(LIGHTING_COLOR_OPTIONS) + [(f'custom-{palette["slot"]}', palette["name"])
+             for palette in self.custom_palettes if palette["enabled"]]
+        self.lighting_color_mode = self.combo("Lighting colours", palette_options,
+                                              state.get("lightingColorMode", "artwork"))
+        self._palette_items = palette_options
         self.bind("lightingColorMode", self.lighting_color_mode, "artwork", "lighting-color-mode",
                   self.lighting_color_mode.currentData())
+        self.custom_palettes_button = QPushButton("Custom palettes...")
+        self.custom_palettes_button.clicked.connect(self.open_custom_palettes)
+        self.content_layout.addWidget(self.custom_palettes_button)
+        self.custom_palettes_button.ensurePolished()
+        self.custom_palettes_button.setMinimumHeight(self.custom_palettes_button.sizeHint().height())
         self.lighting_count_settings, count_layout = self.settings_group()
         self.edge_count, self.edge_count_value = self.slider(
             "Lighting colour count", 2, 8, int(state.get("edgeColorCount", 8)),
@@ -494,10 +734,12 @@ class SidePanel(QWidget):
 
     def update_lighting_settings_visibility(self):
         mode = self.lighting_mode.currentData()
+        color_mode = self.lighting_color_mode.currentData()
         self.edge_swirl.setEnabled(mode != "none")
         self.edge_swirl.setVisible(mode in ("border", "disco"))
         self.lighting_count_settings.setVisible(
-            mode in ("border", "disco") or self.lighting_color_mode.currentData() == "rainbow")
+            color_mode != "gelato" and not str(color_mode).startswith("custom-")
+            and (mode in ("border", "disco") or color_mode == "rainbow"))
         self.lighting_appearance.setVisible(mode in ("border", "disco"))
         self.light_settings.setVisible(mode == "disco")
         self.border_settings.setVisible(mode == "border")
@@ -558,6 +800,28 @@ class SidePanel(QWidget):
         self.content_layout.addWidget(self.show_photosensitivity_warning)
         self.bind("showPhotosensitivityWarning", self.show_photosensitivity_warning, True,
                   "show-photosensitivity-warning", self.show_photosensitivity_warning.isChecked())
+
+    def update_palette_items(self, selected):
+        options = list(LIGHTING_COLOR_OPTIONS)
+        options.extend((f'custom-{palette["slot"]}', palette["name"])
+                       for palette in self.custom_palettes if palette["enabled"])
+        if options != self._palette_items:
+            with QSignalBlocker(self.lighting_color_mode):
+                self.lighting_color_mode.clear()
+                for value, label in options:
+                    self.lighting_color_mode.addItem(label, value)
+                self.lighting_color_mode.setCurrentIndex(self.lighting_color_mode.findData(selected))
+            self._palette_items = options
+            self.update_lighting_settings_visibility()
+
+    def open_custom_palettes(self):
+        dialog = CustomPaletteDialog(self.custom_palettes, self.save_custom_palettes,
+                                     self.capture_palette, self)
+        dialog.exec()
+
+    def save_custom_palettes(self, palettes):
+        self.request("custom-palettes", palettes)
+        self.custom_palettes = palettes
 
     def update_source_gain(self, value):
         source = self.source.currentData()

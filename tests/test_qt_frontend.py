@@ -416,6 +416,329 @@ def test_christmas_theme_changes_lighting_background_and_controls(window):
     assert background() == festive
 
 
+def test_gelato_matches_milky_palette_across_visuals_and_controls(window):
+    milky = ["#fec601", "#02a8fe", "#fe0288", "#d701fd",
+             "#fd6903", "#aae603", "#f959f5", "#fe1536"]
+    state = {"track": {"status": "playing"}, "visualizerMode": 1, "lightingMode": "border",
+             "lightingColorMode": "custom-1", "edgeColorCount": 2,
+             "customPalettes": [{"slot": 1, "name": "Milky", "enabled": True, "colors": milky}],
+             "bars": [.7] * 24, "wave": [math.sin(i / 5) * .5 for i in range(64)]}
+
+    def snapshot(state):
+        window.backend.get_state.return_value = state
+        window.refresh_state()
+        visualizer = window.visualizer
+        background = QImage(300, 200, QImage.Format.Format_ARGB32_Premultiplied)
+        painter = QPainter(background)
+        visualizer.paint_background(painter, 300, 200)
+        painter.end()
+        return (
+            [color.name() for color in window.edge_border.colors],
+            [color.name() for color in visualizer.effect_palette()["colors"]],
+            [color.name() for color in window.edge_border.border_palette(state)],
+            background,
+            window.control_border_color,
+            window.timeline_slider.styleSheet(),
+            window.capture_current_palette(),
+        )
+
+    custom = snapshot(state)
+    builtin = snapshot({**state, "lightingColorMode": "gelato", "customPalettes": []})
+    assert builtin == custom
+    assert builtin[0] == milky
+    assert len(builtin[2]) == 16
+
+    panel = SidePanel({"lightingColorMode": "gelato"}, "visual", qt_frontend.QT_MODES, Mock())
+    assert panel.lighting_color_mode.currentText() == "Gelato"
+    assert panel.lighting_count_settings.isHidden()
+    panel.sync_fields({"customPalettes": state["customPalettes"], "lightingColorMode": "gelato"})
+    assert panel.lighting_color_mode.currentText() == "Gelato"
+    panel.deleteLater()
+
+
+def test_gelato_renders_on_gpu(window):
+    visualizer = window.visualizer
+    if not isinstance(visualizer, qt_frontend.GPUVisualizerWidget):
+        pytest.skip("hardware OpenGL widget unavailable")
+    state = {"track": {"status": "playing"}, "visualizerMode": 0, "lightingMode": "border",
+             "lightingColorMode": "gelato", "bars": [.7] * 24}
+    window.backend.get_state.return_value = state
+    window.refresh_state()
+    assert visualizer.initialized
+    assert not visualizer.grabFramebuffer().isNull()
+    assert len(window.edge_border.border_palette(state)) == 16
+    assert isinstance(window.visualizer, qt_frontend.GPUVisualizerWidget)
+
+
+def test_custom_palette_editor_capture_edit_clear_and_errors(window, monkeypatch):
+    capture = Mock(return_value=["#ff0000", "#00ff00", "#0000ff"])
+    save = Mock()
+    dialog = qt_panels.CustomPaletteDialog([], save, capture, window)
+    dialog.show()
+    slot = dialog.slots[0]
+    slot["name"].setText("  Captured  ")
+    button = next(button for button in dialog.stack.widget(0).findChildren(qt_panels.QPushButton)
+                  if button.text() == "Capture current palette")
+    QTest.mouseClick(button, Qt.MouseButton.LeftButton)
+    capture.assert_called_once()
+    assert [field.text() for field in slot["inputs"][:3]] == capture.return_value
+    slot["inputs"][3].setText("not a colour")
+    dialog.accept()
+    save.assert_not_called()
+    assert "HTML hex" in dialog.status.text()
+    slot["inputs"][3].setText("#abc")
+    monkeypatch.setattr(qt_panels.QColorDialog, "getColor", lambda *_: QColor("#123456"))
+    dialog.choose_color(slot["inputs"][1])
+    slot["enabled"].setChecked(False)
+    dialog.accept()
+    save.assert_called_once_with([{
+        "slot": 1, "name": "Captured", "enabled": False,
+        "colors": ["#ff0000", "#123456", "#0000ff", "#aabbcc"],
+    }])
+
+    dialog.clear_slot(0)
+    assert not slot["name"].text()
+    assert [field.text() for field in slot["inputs"][:2]] == ["", ""]
+    assert all(not field.text() for field in slot["inputs"])
+    dialog.deleteLater()
+
+
+def test_custom_palette_editor_save_failure_and_cancel_do_not_save(window):
+    save = Mock(side_effect=OSError("disk full"))
+    dialog = qt_panels.CustomPaletteDialog([], save, lambda: ["#000000", "#ffffff"], window)
+    dialog.slots[0]["name"].setText("Test")
+    dialog.capture_colors(0)
+    dialog.accept()
+    assert "disk full" in dialog.status.text()
+    assert dialog.result() == 0
+    dialog.reject()
+    assert save.call_count == 1
+    dialog.deleteLater()
+
+
+def test_palette_editor_buttons_have_visible_icons_and_tooltips(window, monkeypatch):
+    dialog = qt_panels.CustomPaletteDialog([], Mock(), Mock(), window)
+    dialog.show()
+    QApplication.processEvents()
+    buttons = dialog.findChild(qt_panels.QDialogButtonBox)
+    save = buttons.button(qt_panels.QDialogButtonBox.StandardButton.Save)
+    cancel = buttons.button(qt_panels.QDialogButtonBox.StandardButton.Cancel)
+    row = dialog.slots[0]["rows"][0]
+    choose = next(button for button in row.findChildren(qt_panels.QPushButton)
+                  if button.toolTip() == "Choose colour...")
+    remove = next(button for button in row.findChildren(qt_panels.QPushButton)
+                  if button.toolTip() == "Remove colour")
+    assert not choose.text() and not remove.text()
+    for button in (save, cancel, choose, remove):
+        image = button.icon().pixmap(20, 20).toImage()
+        assert any(image.pixelColor(x, y).alpha() > 200
+                   and image.pixelColor(x, y).red() > 220
+                   for x in range(image.width()) for y in range(image.height()))
+    assert save.palette().color(QPalette.ColorRole.ButtonText).lightness() > 200
+    monkeypatch.setattr(qt_panels.QColorDialog, "getColor", lambda *_: QColor("#123456"))
+    QTest.mouseClick(choose, Qt.MouseButton.LeftButton)
+    assert dialog.slots[0]["inputs"][0].text() == "#123456"
+    dialog.slots[0]["inputs"][1].setText("#abcdef")
+    dialog.slots[0]["inputs"][2].setText("#ffffff")
+    QTest.mouseClick(remove, Qt.MouseButton.LeftButton)
+    assert [field.text() for field in dialog.slots[0]["inputs"][:2]] == ["#abcdef", "#ffffff"]
+    dialog.reject()
+    dialog.deleteLater()
+
+
+def test_palette_editor_accepts_two_to_eight_optional_fields(window):
+    save = Mock()
+    dialog = qt_panels.CustomPaletteDialog([], save, Mock(), window)
+    dialog.show()
+    QApplication.processEvents()
+    slot = dialog.slots[0]
+    assert all(not row.isHidden() for row in slot["rows"])
+    assert not any(button.text() == "Add colour"
+                   for button in dialog.findChildren(qt_panels.QPushButton))
+    slot["name"].setText("Eight")
+    colors = [f"#{index:06x}" for index in range(8)]
+    for field, color in zip(slot["inputs"], colors):
+        field.setText(color)
+    dialog.accept()
+    assert save.call_args.args[0][0]["colors"] == colors
+    dialog.deleteLater()
+
+
+def test_palette_editor_skips_unused_fields_but_requires_two_colours(window):
+    save = Mock()
+    dialog = qt_panels.CustomPaletteDialog([], save, Mock(), window)
+    slot = dialog.slots[0]
+    slot["name"].setText("Sparse")
+    slot["inputs"][0].setText("#ff0000")
+    dialog.accept()
+    save.assert_not_called()
+    assert "two to eight" in dialog.status.text()
+    slot["inputs"][7].setText("#0000ff")
+    dialog.accept()
+    assert save.call_args.args[0][0]["colors"] == ["#ff0000", "#0000ff"]
+    dialog.deleteLater()
+
+
+def test_custom_palette_dropdown_tracks_enabled_edits_and_reset(window):
+    palettes = [{"slot": 2, "name": "Sunset", "enabled": True, "colors": ["#ff0000", "#0000ff"]},
+                {"slot": 4, "name": "Hidden", "enabled": False, "colors": ["#000000", "#ffffff"]}]
+    requests = []
+    panel = SidePanel({"customPalettes": palettes, "lightingColorMode": "custom-2"}, "visual",
+                      qt_frontend.QT_MODES, lambda *args: requests.append(args))
+    assert panel.lighting_color_mode.currentData() == "custom-2"
+    assert panel.lighting_color_mode.findData("custom-4") == -1
+    changed = [{**palettes[0], "name": "Sunrise"}, {**palettes[1], "enabled": True}]
+    panel.sync_fields({"customPalettes": changed, "lightingColorMode": "custom-2"})
+    assert panel.lighting_color_mode.currentText() == "Sunrise"
+    assert panel.lighting_color_mode.findData("custom-4") >= 0
+    assert requests == []
+    panel.reset_fields()
+    assert panel.lighting_color_mode.currentData() == "artwork"
+    assert panel.custom_palettes == changed
+    assert not any(request[0] == "custom-palettes" for request in requests)
+    panel.deleteLater()
+
+
+def test_custom_palettes_button_is_in_visual_lighting_section(window):
+    visual = SidePanel({}, "visual", qt_frontend.QT_MODES, Mock())
+    settings = SidePanel({}, "settings", qt_frontend.QT_MODES, Mock())
+    layout = visual.content_layout
+    assert layout.indexOf(visual.custom_palettes_button) == layout.indexOf(visual.lighting_color_mode) + 1
+    assert not any(button.text() == "Custom palettes..."
+                   for button in settings.findChildren(qt_panels.QPushButton))
+    visual.deleteLater()
+    settings.deleteLater()
+
+
+def test_custom_palettes_button_label_is_rendered_in_short_panel(window):
+    window.open_mode_menu()
+    panel = window.side_panel
+    panel.resize(400, 420)
+    QApplication.processEvents()
+    button = panel.custom_palettes_button
+    panel.scroll.ensureWidgetVisible(button)
+    QApplication.processEvents()
+    assert button.height() >= button.sizeHint().height()
+    labeled = button.grab().toImage()
+    button.setText("")
+    QApplication.processEvents()
+    unlabeled = button.grab().toImage()
+    assert labeled != unlabeled
+
+
+def test_visual_panel_opens_palette_editor_and_captures_current_colours(window):
+    requests = []
+    panel = SidePanel({}, "visual", qt_frontend.QT_MODES, lambda *args: requests.append(args),
+                      capture_palette=lambda: ["#ff0000", "#00ff00"])
+    panel.show()
+    def save_palette():
+        dialog = QApplication.activeModalWidget()
+        try:
+            dialog.slots[0]["name"].setText("Captured")
+            dialog.capture_colors(0)
+            dialog.accept()
+        finally:
+            dialog.reject()
+    QTimer.singleShot(0, save_palette)
+    QTest.mouseClick(panel.custom_palettes_button, Qt.MouseButton.LeftButton)
+    assert requests == [("custom-palettes", [{
+        "slot": 1, "name": "Captured", "enabled": True, "colors": ["#ff0000", "#00ff00"],
+    }])]
+    panel.close()
+    panel.deleteLater()
+
+
+@pytest.mark.parametrize("count", [2, 8])
+@pytest.mark.parametrize("mode", [0, 1, 2, 4])
+def test_custom_palettes_render_all_visualizations(window, count, mode):
+    colors = ["#ff0000", "#00ff00", "#0000ff", "#ffff00",
+              "#ff00ff", "#00ffff", "#ff8800", "#8888ff"][:count]
+    palette = {"slot": 1, "name": "Test", "enabled": True, "colors": colors}
+    state = {"track": {"status": "playing"}, "visualizerMode": mode,
+             "lightingColorMode": "custom-1", "customPalettes": [palette],
+             "bars": [.7] * 24, "wave": [math.sin(i / 5) * .5 for i in range(64)]}
+    window.backend.get_state.return_value = state
+    window.refresh_state()
+    visualizer = window.visualizer
+    assert [color.name() for color in window.edge_border.colors] == colors
+    assert [color.name() for color in visualizer.effect_palette()["colors"]] == colors
+    assert [color.name() for _, color in qt_frontend.scope_gradient(
+        500, visualizer.effect_palette()).stops()] == colors
+    assert len(window.edge_border.border_palette(state)) == count * 2
+    assert all(color in window.timeline_slider.styleSheet() for color in colors)
+    image = QImage(visualizer.width(), visualizer.height(), QImage.Format.Format_ARGB32_Premultiplied)
+    visualizer.paint_scene(QPainter(image))
+    assert not image.isNull()
+
+    before = visualizer.custom_background
+    palette["colors"] = ["#111111", "#eeeeee"]
+    visualizer.paint_scene(QPainter(image))
+    assert visualizer.custom_background is not before
+
+
+def test_artwork_right_click_offers_palette_only_on_effect(window, monkeypatch):
+    offered = []
+    monkeypatch.setattr(window, "open_artwork_palette_menu", lambda point: offered.append(point))
+    window.state = {**window.state, "lightingColorMode": "artwork", "artworkMode": "album"}
+    QTest.mouseClick(window.visualizer, Qt.MouseButton.RightButton, pos=QPoint(320, 100))
+    assert len(offered) == 1
+    window.state["lightingColorMode"] = "rainbow"
+    QTest.mouseClick(window.visualizer, Qt.MouseButton.RightButton, pos=QPoint(320, 100))
+    assert len(offered) == 1
+    window.state["lightingColorMode"] = "artwork"
+    QTest.mouseClick(window.timeline_container, Qt.MouseButton.RightButton)
+    assert len(offered) == 1
+    window.visualizer.track_palette = {"edge": [QColor("red"), QColor("red")]}
+    with pytest.raises(ValueError, match="two distinct"):
+        window.artwork_palette_colors()
+    window.visualizer.track_palette = {"edge": [QColor("red"), QColor("blue")]}
+    assert window.artwork_palette_colors() == ["#ff0000", "#0000ff"]
+
+
+def test_artwork_palette_editor_uses_empty_slot_and_rejects_full(window):
+    palettes = [{"slot": 1, "name": "First", "enabled": True, "colors": ["#000", "#fff"]}]
+    dialog = qt_panels.CustomPaletteDialog(palettes, Mock(), Mock(), window,
+                                            artwork_colors=["#ff0000", "#0000ff"])
+    assert dialog.slot_selector.currentData() == 2
+    assert [field.text() for field in dialog.slots[1]["inputs"][:2]] == ["#ff0000", "#0000ff"]
+    dialog.deleteLater()
+    palettes = [{**palettes[0], "slot": slot, "name": str(slot)} for slot in range(1, 9)]
+    with pytest.raises(ValueError, match="All eight"):
+        qt_panels.CustomPaletteDialog(palettes, Mock(), Mock(), window,
+                                     artwork_colors=["#ff0000", "#0000ff"])
+
+
+def test_artwork_palette_menu_opens_editor_with_sampled_colours(window, monkeypatch):
+    window.visualizer.track_palette = {"edge": [QColor("red"), QColor("blue")]}
+    open_editor = Mock()
+    monkeypatch.setattr(window, "open_artwork_palette_dialog", open_editor)
+    window.open_artwork_palette_menu(window.mapToGlobal(QPoint(320, 100)))
+    menu = next(menu for menu in window.findChildren(qt_frontend.QMenu)
+                if menu.actions() and menu.actions()[0].text() == "Save artwork palette...")
+    menu.actions()[0].trigger()
+    open_editor.assert_called_once_with(["#ff0000", "#0000ff"])
+    menu.close()
+
+
+@pytest.mark.parametrize("count", [2, 8])
+def test_gpu_renders_custom_palette_with_shader(window, count):
+    visualizer = window.visualizer
+    if not isinstance(visualizer, qt_frontend.GPUVisualizerWidget):
+        pytest.skip("hardware OpenGL widget unavailable")
+    colors = ["#ff0000", "#00ff00", "#0000ff", "#ffff00",
+              "#ff00ff", "#00ffff", "#ff8800", "#8888ff"][:count]
+    palette = {"slot": 1, "name": "GPU", "enabled": True, "colors": colors}
+    state = {"track": {"status": "playing"}, "visualizerMode": 0, "lightingMode": "border",
+             "lightingColorMode": "custom-1", "customPalettes": [palette], "bars": [.7] * 24}
+    window.backend.get_state.return_value = state
+    window.refresh_state()
+    assert visualizer.initialized
+    image = visualizer.grabFramebuffer()
+    assert not image.isNull()
+    assert len(window.edge_border.border_palette(state)) == count * 2
+    assert isinstance(window.visualizer, qt_frontend.GPUVisualizerWidget)
+
+
 def test_fullscreen_button_in_lower_controls_toggles_fullscreen(window):
     button = window.fullscreen_button
     assert button.parentWidget() is window.settings_button.parentWidget()

@@ -49,9 +49,9 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 
-from .backend import APP_ICON_PATH, SOURCE_PROMPT_SECONDS_DEFAULT, AmbiBeatBackend
+from .backend import APP_ICON_PATH, SOURCE_PROMPT_SECONDS_DEFAULT, AmbiBeatBackend, custom_palette_for_mode
 from .qt_gpu import BorderShader, gpu_available
-from .qt_panels import SidePanel, WheelIgnoringSlider, source_icon
+from .qt_panels import CustomPaletteDialog, SidePanel, WheelIgnoringSlider, source_icon
 
 
 QT_MODES = (
@@ -62,6 +62,21 @@ QT_MODES = (
     (5, "No visualisation"),
 )
 CHRISTMAS_COLORS = ("#e42c3e", "#36c66a", "#ffd575")
+GELATO_COLORS = ("#fec601", "#02a8fe", "#fe0288", "#d701fd",
+                 "#fd6903", "#aae603", "#f959f5", "#fe1536")
+
+
+def fixed_palette_for_state(state):
+    mode = state.get("lightingColorMode")
+    if mode == "gelato":
+        return {"colors": GELATO_COLORS}
+    return custom_palette_for_mode(state.get("customPalettes") or [], mode)
+
+
+def palette_control_color(palette):
+    color = QColor(palette["colors"][-1])
+    hue, saturation, lightness, _ = color.getHslF()
+    return QColor.fromHslF(max(0, hue), saturation, max(.72, lightness)).name()
 
 
 def format_track_time(microseconds):
@@ -157,8 +172,12 @@ def scope_gradient(width, active_palette):
     colors = (active_palette["colors"] if active_palette else
               [QColor("#37ff9a"), QColor("#baff8a"), QColor("#37ff9a")])
     gradient = QLinearGradient(width * .08, 0, width * .92, 0)
-    for position, color in zip((0, .5, 1), (colors[0], colors[2], colors[1])):
-        gradient.setColorAt(position, color)
+    if active_palette and active_palette.get("custom"):
+        for index, color in enumerate(colors):
+            gradient.setColorAt(index / (len(colors) - 1), color)
+    else:
+        for position, color in zip((0, .5, 1), (colors[0], colors[2], colors[1])):
+            gradient.setColorAt(position, color)
     return gradient
 
 
@@ -219,8 +238,7 @@ class MovingEdgeBorder(QWidget):
 
     def border_palette(self, state):
         colors = self.adjusted_colors(state)
-        if (not state.get("edgeSwirl")
-                and state.get("lightingColorMode") not in ("rainbow", "christmas")):
+        if not state.get("edgeSwirl") and state.get("lightingColorMode", "artwork") == "artwork":
             return [colors[1 % len(colors)], colors[2 % len(colors)],
                     colors[0], colors[1 % len(colors)]]
         return colors + list(reversed(colors))
@@ -416,6 +434,8 @@ class VisualizerRenderer:
         self.background_cache = None
         self.background_palette = None
         self.background_size = None
+        self.custom_background_key = None
+        self.custom_background = None
         self.christmas_background = {
             "base": QColor("#07150e"),
             "background": [QColor("#1a3b24"), QColor("#492024"),
@@ -532,6 +552,9 @@ class VisualizerRenderer:
 
     def effect_palette(self):
         mode = self.state.get("lightingColorMode", "artwork")
+        fixed = fixed_palette_for_state(self.state)
+        if fixed:
+            return {"colors": [QColor(color) for color in fixed["colors"]], "custom": True}
         if mode == "christmas":
             return {"colors": [QColor(color) for color in CHRISTMAS_COLORS]}
         if mode == "rainbow":
@@ -595,7 +618,20 @@ class VisualizerRenderer:
 
     def paint_background(self, painter, width, height):
         color_mode = self.state.get("lightingColorMode")
-        palette = (None if color_mode == "rainbow" else
+        fixed = fixed_palette_for_state(self.state)
+        if fixed:
+            key = tuple(fixed["colors"])
+            if key != self.custom_background_key:
+                colors = [QColor(color).darker(200) for color in key]
+                count = min(5, len(colors))
+                self.custom_background = {
+                    "base": QColor("#090b12"),
+                    "background": [colors[round(index * (len(colors) - 1) / (count - 1))]
+                                   for index in range(count)],
+                }
+                self.custom_background_key = key
+        palette = (self.custom_background if fixed else
+                   None if color_mode == "rainbow" else
                    self.christmas_background if color_mode == "christmas" else
                    self.active_palette())
         size = (width, height, self.devicePixelRatioF())
@@ -796,8 +832,12 @@ class VisualizerRenderer:
                     else [QColor("#1b5bff"), QColor("#6a70ff"), QColor("#b46cff")]
                 )
                 gradient = QLinearGradient(0, height, 0, 0)
-                for position, color in zip((0, .55, 1), palette):
-                    gradient.setColorAt(position, color)
+                if active_palette and active_palette.get("custom"):
+                    for index, color in enumerate(palette):
+                        gradient.setColorAt(index / (len(palette) - 1), color)
+                else:
+                    for position, color in zip((0, .55, 1), palette):
+                        gradient.setColorAt(position, color)
                 for index, value in enumerate(bars):
                     bar_height = max(2, float(value) * layout_height * 0.58)
                     x = width * .08 + index * (bar_width + gap)
@@ -806,8 +846,8 @@ class VisualizerRenderer:
                     painter.setPen(Qt.PenStyle.NoPen)
                     painter.drawRect(QRectF(x, layout_bottom - bar_height, bar_width, bar_height))
                     painter.setOpacity(1)
-                    peak_color = (palette[-1] if self.state.get("lightingColorMode")
-                                  in ("rainbow", "christmas") else QColor("#80d8ff"))
+                    peak_color = (palette[-1] if self.state.get("lightingColorMode", "artwork")
+                                  != "artwork" else QColor("#80d8ff"))
                     painter.fillRect(QRectF(x, layout_bottom - self.peaks[index] * layout_height * .58 - 1,
                                             bar_width, 2), peak_color)
 
@@ -853,7 +893,7 @@ class VisualizerRenderer:
             if not display_pixmap:
                 glow = QRadialGradient(cx, cy, halo_outer_radius)
                 if active_palette:
-                    glow.setColorAt(0, active_palette["colors"][2])
+                    glow.setColorAt(0, active_palette["colors"][-1])
                     glow.setColorAt(.6, active_palette["colors"][0])
                 else:
                     glow.setColorAt(0, QColor(0, 176, 255, 217))
@@ -931,7 +971,7 @@ class VisualizerRenderer:
                 painter.drawPath(path)
             core_radius = size * (.025 + sound_pulse * .035) * 3
             glow = QRadialGradient(cx, cy, core_radius)
-            glow.setColorAt(0, palette[2])
+            glow.setColorAt(0, palette[-1])
             glow.setColorAt(1, QColor(0, 0, 0, 0))
             painter.setOpacity(.2 + sound_pulse * .35)
             painter.setPen(Qt.PenStyle.NoPen)
@@ -1418,6 +1458,16 @@ class AmbiBeatQtWindow(QMainWindow):
                 and self.side_panel is not None):
             self.close_side_panel()
             return True
+        if (watched in (self.visualizer, self.centralWidget())
+                and event.type() == QEvent.Type.MouseButtonPress
+                and event.button() == Qt.MouseButton.RightButton
+                and self.state.get("lightingColorMode", "artwork") == "artwork"
+                and self.state.get("artworkMode", "album") == "album"):
+            central = self.centralWidget()
+            target = central.childAt(central.mapFromGlobal(event.globalPosition().toPoint()))
+            if target in (None, self.visualizer):
+                self.open_artwork_palette_menu(event.globalPosition().toPoint())
+                return True
         if (background and event.type() in (QEvent.Type.MouseButtonPress,
                                             QEvent.Type.MouseButtonDblClick)
                 and event.button() == Qt.MouseButton.LeftButton):
@@ -1436,6 +1486,47 @@ class AmbiBeatQtWindow(QMainWindow):
             self.show_controls()
             self.show_fullscreen_cursor()
         return super().eventFilter(watched, event)
+
+    def artwork_palette_colors(self):
+        palette = self.visualizer.track_palette
+        if not palette:
+            raise ValueError("Album artwork colours are not available")
+        colors = list(dict.fromkeys(color.name() for color in palette["edge"]))
+        if len(colors) < 2:
+            raise ValueError("Album artwork needs at least two distinct colours")
+        return colors[:8]
+
+    def capture_current_palette(self):
+        fixed = fixed_palette_for_state(self.state)
+        colors = (list(fixed["colors"]) if fixed else
+                  list(dict.fromkeys(color.name() for color in self.edge_border.colors)))
+        if not 2 <= len(colors) <= 8:
+            raise ValueError("The current palette needs at least two colours")
+        return colors
+
+    def open_artwork_palette_menu(self, position):
+        menu = QMenu(self)
+        menu.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        try:
+            colors = self.artwork_palette_colors()
+        except ValueError as error:
+            action = menu.addAction(str(error))
+            action.setEnabled(False)
+        else:
+            action = menu.addAction("Save artwork palette...")
+            action.triggered.connect(lambda: self.open_artwork_palette_dialog(colors))
+        menu.popup(position)
+
+    def open_artwork_palette_dialog(self, colors):
+        palettes = self.state.get("customPalettes") or []
+        try:
+            dialog = CustomPaletteDialog(
+                palettes, lambda value: self.panel_request("custom-palettes", value),
+                self.capture_current_palette, self, artwork_colors=colors)
+        except ValueError as error:
+            QMessageBox.warning(self, "Custom palettes", str(error))
+            return
+        dialog.exec()
 
     def open_source_menu(self):
         menu = QMenu(self)
@@ -1789,7 +1880,10 @@ class AmbiBeatQtWindow(QMainWindow):
                     self.visualizer.clear_art()
             palette = self.visualizer.active_palette()
             self.update_control_borders(palette)
-            if state.get("lightingColorMode") == "rainbow":
+            fixed = fixed_palette_for_state(state)
+            if fixed:
+                self.edge_border.set_palette(fixed["colors"])
+            elif state.get("lightingColorMode") == "rainbow":
                 count = int(state.get("edgeColorCount", 8))
                 self.edge_border.set_palette([
                     QColor.fromHslF(index / count, 1, .5).name() for index in range(count)
@@ -1816,8 +1910,10 @@ class AmbiBeatQtWindow(QMainWindow):
                 self._last_refresh_error = message
 
     def update_control_borders(self, palette):
+        fixed = fixed_palette_for_state(self.state)
         color = ("#ffffff" if self.state.get("lightingColorMode") == "rainbow" else
                  CHRISTMAS_COLORS[2] if self.state.get("lightingColorMode") == "christmas"
+                 else palette_control_color(fixed) if fixed
                  else palette["colors"][-1].name() if palette else None)
         if color == self.control_border_color:
             return
@@ -1829,7 +1925,11 @@ class AmbiBeatQtWindow(QMainWindow):
         self.position_metadata()
 
     def update_timeline_theme(self, palette):
-        if self.state.get("lightingColorMode") == "rainbow":
+        fixed = fixed_palette_for_state(self.state)
+        if fixed:
+            colors = self.edge_border.colors
+            handle = palette_control_color(fixed)
+        elif self.state.get("lightingColorMode") == "rainbow":
             colors = self.edge_border.colors + self.edge_border.colors[:1]
             handle = "#ffffff"
         elif self.state.get("lightingColorMode") == "christmas":
@@ -1979,6 +2079,8 @@ class AmbiBeatQtWindow(QMainWindow):
         elif name == "source-prompt-enabled":
             self.state = {**self.state, "sourcePromptEnabled": value}
             self.update_source_prompts(self.state.get("sources") or [], self.state.get("selectedSource"))
+        elif name in ("custom-palettes", "lighting-color-mode", "artwork-mode", "edge-color-count"):
+            self.refresh_state()
         if warning:
             QMessageBox.warning(self, "Playback source", warning)
 
@@ -2011,7 +2113,8 @@ class AmbiBeatQtWindow(QMainWindow):
             self.panel_animation.deleteLater()
         self.panel_closing = False
         central = self.centralWidget()
-        panel = SidePanel(self.state, kind, QT_MODES, self.panel_request, central)
+        panel = SidePanel(self.state, kind, QT_MODES, self.panel_request, central,
+                          capture_palette=self.capture_current_palette)
         self.side_panel = panel
         panel.close_requested.connect(self.close_side_panel)
         for widget in [panel] + panel.findChildren(QWidget):

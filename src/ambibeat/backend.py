@@ -59,7 +59,8 @@ SOURCE_PROMPT_SECONDS_MIN = 3
 SOURCE_PROMPT_SECONDS_MAX = 60
 SOURCE_PROMPT_SECONDS_DEFAULT = 10
 LIGHTING_MODES = ("border", "disco", "none")
-LIGHTING_COLOR_MODES = ("artwork", "rainbow", "christmas")
+LIGHTING_COLOR_MODES = ("artwork", "rainbow", "christmas", "gelato")
+CUSTOM_PALETTE_LIMIT = 8
 DISCO_LIGHT_STYLES = ("glow", "fairy", "bulb", "star")
 DISCO_WIRE_COLORS = ("green", "theme", "none")
 DISCO_LIGHT_COUNT_MIN = 3
@@ -89,6 +90,43 @@ _VERSION_SUFFIXES = {
 _ARTIST_ALIAS_GROUPS = (
     frozenset({"lady antebellum", "lady a"}),
 )
+
+
+def normalize_custom_palettes(palettes):
+    if not isinstance(palettes, list) or len(palettes) > CUSTOM_PALETTE_LIMIT:
+        raise ValueError("A maximum of eight custom palettes is allowed")
+    result = []
+    slots, names = set(), set()
+    for palette in palettes:
+        if not isinstance(palette, dict):
+            raise ValueError("Invalid custom palette")
+        slot, name = palette.get("slot"), palette.get("name")
+        colors, enabled = palette.get("colors"), palette.get("enabled")
+        if (not isinstance(slot, int) or isinstance(slot, bool) or not 1 <= slot <= CUSTOM_PALETTE_LIMIT
+                or slot in slots):
+            raise ValueError("Invalid or duplicate palette slot")
+        if not isinstance(name, str) or not name.strip() or name.strip().casefold() in names:
+            raise ValueError("Palette names must be non-empty and unique")
+        if not isinstance(enabled, bool):
+            raise ValueError("Invalid palette enabled setting")
+        if not isinstance(colors, list) or not 2 <= len(colors) <= 8:
+            raise ValueError("A palette must contain two to eight colours")
+        normalized = []
+        for color in colors:
+            if not isinstance(color, str) or not re.fullmatch(r"#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})", color):
+                raise ValueError("Colours must be HTML hex codes such as #ff8800")
+            value = color[1:].lower()
+            normalized.append("#" + ("".join(char * 2 for char in value) if len(value) == 3 else value))
+        name = name.strip()
+        slots.add(slot)
+        names.add(name.casefold())
+        result.append({"slot": slot, "name": name, "colors": normalized, "enabled": enabled})
+    return sorted(result, key=lambda palette: palette["slot"])
+
+
+def custom_palette_for_mode(palettes, mode):
+    return next((palette for palette in palettes
+                 if palette["enabled"] and mode == f'custom-{palette["slot"]}'), None)
 
 
 def _load_app_settings():
@@ -261,8 +299,17 @@ def _load_app_settings():
     elif "lighting_mode" in data:
         print("Ignoring invalid saved lighting mode", flush=True)
 
+    custom_palettes = []
+    if "custom_palettes" in data:
+        try:
+            custom_palettes = normalize_custom_palettes(data["custom_palettes"])
+            settings["custom_palettes"] = custom_palettes
+        except ValueError as error:
+            print(f"Ignoring invalid saved custom palettes: {error}", flush=True)
+
     lighting_color_mode = data.get("lighting_color_mode")
-    if lighting_color_mode in LIGHTING_COLOR_MODES:
+    if (lighting_color_mode in LIGHTING_COLOR_MODES
+            or custom_palette_for_mode(custom_palettes, lighting_color_mode)):
         settings["lighting_color_mode"] = lighting_color_mode
     elif "lighting_color_mode" in data:
         print("Ignoring invalid saved lighting colour mode", flush=True)
@@ -785,6 +832,7 @@ class AmbiBeatBackend:
         self.scope_line_width = settings.get("scope_line_width", SCOPE_LINE_WIDTH_DEFAULT)
         self.edge_swirl = settings.get("edge_swirl", False)
         self.lighting_mode = settings.get("lighting_mode", "border")
+        self.custom_palettes = settings.get("custom_palettes", [])
         self.lighting_color_mode = settings.get("lighting_color_mode", "artwork")
         self.disco_light_style = settings.get("disco_light_style", "glow")
         self.disco_wire_color = settings.get("disco_wire_color", "green")
@@ -965,6 +1013,7 @@ class AmbiBeatBackend:
             "album-art-opacity": self.set_album_art_opacity,
             "lighting-mode": self.set_lighting_mode,
             "lighting-color-mode": self.set_lighting_color_mode,
+            "custom-palettes": self.set_custom_palettes,
             "edge-swirl": self.set_edge_swirl,
             "edge-color-intensity": self.set_edge_color_intensity,
             "edge-fade": self.set_edge_fade,
@@ -1218,7 +1267,7 @@ class AmbiBeatBackend:
         return True
 
     def set_lighting_color_mode(self, mode):
-        if mode not in LIGHTING_COLOR_MODES:
+        if mode not in LIGHTING_COLOR_MODES and not custom_palette_for_mode(self.custom_palettes, mode):
             return False
         previous_mode = self.lighting_color_mode
         self.lighting_color_mode = mode
@@ -1226,6 +1275,20 @@ class AmbiBeatBackend:
             self._save_settings()
         except OSError:
             self.lighting_color_mode = previous_mode
+            raise
+        return True
+
+    def set_custom_palettes(self, palettes):
+        normalized = normalize_custom_palettes(palettes)
+        previous, previous_mode = self.custom_palettes, self.lighting_color_mode
+        self.custom_palettes = normalized
+        if (self.lighting_color_mode not in LIGHTING_COLOR_MODES
+                and not custom_palette_for_mode(normalized, self.lighting_color_mode)):
+            self.lighting_color_mode = "artwork"
+        try:
+            self._save_settings()
+        except OSError:
+            self.custom_palettes, self.lighting_color_mode = previous, previous_mode
             raise
         return True
 
@@ -1309,6 +1372,7 @@ class AmbiBeatBackend:
                 "scope_line_width": self.scope_line_width,
                 "edge_swirl": self.edge_swirl,
                 "lighting_mode": self.lighting_mode,
+                "custom_palettes": self.custom_palettes,
                 "lighting_color_mode": self.lighting_color_mode,
                 "disco_light_style": self.disco_light_style,
                 "disco_wire_color": self.disco_wire_color,
@@ -1870,6 +1934,8 @@ class AmbiBeatBackend:
                 "scopeLineWidth": self.scope_line_width,
                 "edgeSwirl": self.edge_swirl,
                 "lightingMode": self.lighting_mode,
+                "customPalettes": [{**palette, "colors": list(palette["colors"])}
+                                   for palette in self.custom_palettes],
                 "lightingColorMode": self.lighting_color_mode,
                 "discoLightStyle": self.disco_light_style,
                 "discoWireColor": self.disco_wire_color,
