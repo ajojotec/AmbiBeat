@@ -1425,6 +1425,65 @@ def test_visualization_analysis_updates_twice_as_fast():
     assert MODULE.ANALYSIS_INTERVAL == 0.05
 
 
+def test_deb_builder_packages_application_and_dependencies(tmp_path):
+    if not shutil.which("dpkg-deb"):
+        pytest.skip("dpkg-deb is unavailable")
+    root = MODULE_PATH.parents[2]
+    output = tmp_path / "output with spaces"
+    subprocess.run([str(root / "scripts" / "build-deb.sh"), str(output)],
+                   check=True, capture_output=True, text=True)
+    packages = list(output.glob("ambibeat_*_all.deb"))
+    assert len(packages) == 1
+    package = packages[0]
+    metadata = subprocess.run(["dpkg-deb", "--field", str(package)], check=True,
+                              capture_output=True, text=True).stdout
+    assert "Architecture: all" in metadata
+    for dependency in ("python3-dbus", "python3-gi", "python3-numpy",
+                       "python3-pyside6.qtopengl", "python3-pyside6.qtopenglwidgets",
+                       "qt6-qpa-plugins", "qt6-wayland", "pulseaudio-utils"):
+        assert dependency in metadata
+
+    extracted = tmp_path / "extracted"
+    subprocess.run(["dpkg-deb", "--extract", str(package), str(extracted)], check=True)
+    package_dir = extracted / "usr" / "lib" / "python3" / "dist-packages"
+    desktop = extracted / "usr" / "share" / "applications" / "ambibeat.desktop"
+    assert "Exec=/usr/bin/ambibeat" in desktop.read_text()
+    assert desktop.stat().st_mode & 0o777 == 0o644
+    assert (extracted / "usr" / "bin" / "ambibeat").stat().st_mode & 0o111
+    assert os.readlink(extracted / "usr" / "bin" / "ambibeat-qt") == "ambibeat"
+    assert (extracted / "usr" / "share" / "icons" / "hicolor" / "512x512" / "apps" / "ambibeat.png").is_file()
+    assert (extracted / "usr" / "share" / "doc" / "ambibeat" / "copyright").is_file()
+    assert not list(package_dir.rglob("__pycache__"))
+    if shutil.which("desktop-file-validate"):
+        subprocess.run(["desktop-file-validate", str(desktop)], check=True)
+    code = (
+        "from pathlib import Path; from unittest.mock import Mock; "
+        "import ambibeat.qt_frontend as qt; "
+        "app = qt.QApplication([]); backend = Mock(); "
+        "backend.get_state.return_value = {'track': {}, 'sources': []}; "
+        "window = qt.AmbiBeatQtWindow(backend); window.timer.stop(); window.show(); "
+        "app.processEvents(); window.close(); "
+        "print(Path(qt.__file__).resolve()); print(Path(qt.APP_ICON_PATH).is_file())"
+    )
+    env = {**os.environ, "PYTHONPATH": str(package_dir), "QT_QPA_PLATFORM": "offscreen"}
+    result = subprocess.run([sys.executable, "-c", code], cwd=tmp_path, env=env,
+                            check=True, capture_output=True, text=True)
+    assert result.stdout.splitlines() == [str(package_dir / "ambibeat" / "qt_frontend.py"), "True"]
+
+
+def test_deb_builder_rejects_invalid_package_version(tmp_path):
+    root = MODULE_PATH.parents[2]
+    scripts = tmp_path / "project" / "scripts"
+    scripts.mkdir(parents=True)
+    shutil.copyfile(root / "scripts" / "build-deb.sh", scripts / "build-deb.sh")
+    (scripts.parent / "pyproject.toml").write_text('[project]\nversion = "1/../bad"\n')
+    result = subprocess.run(["bash", str(scripts / "build-deb.sh")],
+                            capture_output=True, text=True)
+    assert result.returncode != 0
+    assert "Invalid Debian package version" in result.stderr
+    assert not (scripts.parent / "dist").exists()
+
+
 def test_installer_creates_native_app_launcher():
     install_source = (MODULE_PATH.parents[2] / "scripts" / "install.sh").read_text(
         encoding="utf-8"

@@ -125,6 +125,27 @@ than a reproducible lock file.
 
 ## Install
 
+### Debian package
+
+On Debian 13 or a compatible system with Python 3.11+ and `dpkg-deb`, build and
+install the package with:
+
+```bash
+./scripts/build-deb.sh
+sudo apt install ./dist/ambibeat_1.0.0_all.deb
+```
+
+The package filename uses the version from `pyproject.toml`. Pass an output
+directory to the script to use a location other than `dist/`. Building does
+not require root or install dependencies; `apt` installs the required Debian
+packages when installing the `.deb`. The package provides the `ambibeat` and
+`ambibeat-qt` commands and an application-menu entry.
+
+The application icons have separate redistribution restrictions; see
+[icon attribution](src/ambibeat/assets/ATTRIBUTION.txt) before distributing a package.
+
+### Development installer
+
 ```bash
 ./scripts/install.sh
 ```
