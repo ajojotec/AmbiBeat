@@ -8,9 +8,9 @@ import pytest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 pytest.importorskip("PySide6")
 
-from PySide6.QtCore import QAbstractAnimation, QBuffer, QEvent, QIODevice, QPoint, QPointF, QRectF, Qt
+from PySide6.QtCore import QAbstractAnimation, QBuffer, QEvent, QIODevice, QPoint, QPointF, QRectF, Qt, QTimer
 from PySide6.QtGui import (
-    QColor, QImage, QMouseEvent, QOpenGLContext, QPaintEngine, QPainter, QPixmap, QWheelEvent,
+    QColor, QFont, QImage, QMouseEvent, QOpenGLContext, QPaintEngine, QPainter, QPalette, QPixmap, QWheelEvent,
 )
 from PySide6.QtOpenGL import QOpenGLFramebufferObject
 from PySide6.QtTest import QTest
@@ -50,28 +50,123 @@ def wait_for_panel_animation(window):
     assert animation.state() != QAbstractAnimation.State.Running
 
 
-def test_main_starts_with_session_bus_and_stops_backend(tmp_path, monkeypatch):
+@pytest.mark.parametrize("acknowledged,remember", [(False, False), (False, True), (True, False)])
+def test_main_starts_with_session_bus_and_stops_backend(tmp_path, monkeypatch, acknowledged, remember):
     app = Mock()
     app.exec.return_value = 0
     backend = Mock()
+    backend.photosensitivity_warning_acknowledged = acknowledged
     session_bus = object()
-    system_bus = object()
     backend_factory = Mock(return_value=backend)
     window = Mock()
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
     monkeypatch.setattr(qt_frontend, "QApplication", lambda *_: app)
     monkeypatch.setattr(qt_frontend.dbus.mainloop.glib, "DBusGMainLoop", lambda **_: None)
     monkeypatch.setattr(qt_frontend.dbus, "SessionBus", lambda: session_bus)
-    monkeypatch.setattr(qt_frontend.dbus, "SystemBus", lambda: system_bus)
     monkeypatch.setattr(qt_frontend, "AmbiBeatBackend", backend_factory)
-    monkeypatch.setattr(qt_frontend, "AmbiBeatQtWindow", lambda value: window)
+    window_factory = Mock(return_value=window)
+    monkeypatch.setattr(qt_frontend, "AmbiBeatQtWindow", window_factory)
+    def warning():
+        window_factory.assert_not_called()
+        app.setPalette.assert_not_called()
+        return True, remember
+    warning_dialog = Mock(side_effect=warning)
+    monkeypatch.setattr(qt_frontend, "show_photosensitivity_warning", warning_dialog)
     monkeypatch.setattr(qt_frontend.signal, "signal", lambda *_: None)
     monkeypatch.setattr(qt_frontend, "QTimer", Mock)
 
     assert qt_frontend.main() == 0
-    backend_factory.assert_called_once_with(session_bus, system_bus)
+    backend_factory.assert_called_once_with(session_bus)
+    assert warning_dialog.call_count == (0 if acknowledged else 1)
+    assert backend.acknowledge_photosensitivity_warning.call_count == int(not acknowledged and remember)
+    app.setPalette.assert_called_once()
     window.show.assert_called_once()
     backend.stop.assert_called_once()
+
+
+@pytest.mark.parametrize("result,save_fails,exit_code", [
+    ((False, False), False, 0),
+    ((True, True), True, 1),
+])
+def test_warning_must_be_acknowledged_and_saved_before_opening(
+    tmp_path, monkeypatch, result, save_fails, exit_code
+):
+    backend = Mock()
+    backend.photosensitivity_warning_acknowledged = False
+    if save_fails:
+        backend.acknowledge_photosensitivity_warning.side_effect = OSError("disk full")
+    window_factory = Mock()
+    error_dialog = Mock()
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr(qt_frontend, "QApplication", lambda *_: Mock())
+    monkeypatch.setattr(qt_frontend.dbus.mainloop.glib, "DBusGMainLoop", lambda **_: None)
+    monkeypatch.setattr(qt_frontend.dbus, "SessionBus", lambda: object())
+    monkeypatch.setattr(qt_frontend, "AmbiBeatBackend", lambda _: backend)
+    monkeypatch.setattr(qt_frontend, "AmbiBeatQtWindow", window_factory)
+    monkeypatch.setattr(qt_frontend, "show_photosensitivity_warning", lambda: result)
+    monkeypatch.setattr(qt_frontend.QMessageBox, "critical", error_dialog)
+    assert qt_frontend.main() == exit_code
+    window_factory.assert_not_called()
+    backend.stop.assert_called_once()
+    assert backend.acknowledge_photosensitivity_warning.call_count == int(save_fails)
+    if save_fails:
+        assert "disk full" in error_dialog.call_args.args[2]
+    else:
+        error_dialog.assert_not_called()
+
+
+@pytest.mark.parametrize("remember,cancel", [(False, False), (True, False), (True, True)])
+def test_photosensitivity_dialog_defaults_to_not_remembering(window, remember, cancel):
+    observed = {}
+    def respond():
+        dialog = QApplication.activeModalWidget()
+        checkbox = dialog.checkBox()
+        observed["initially_checked"] = checkbox.isChecked()
+        observed["text"] = dialog.text()
+        observed["buttons"] = [button.text() for button in dialog.buttons()]
+        checkbox.setChecked(remember)
+        if cancel:
+            dialog.button(qt_frontend.QMessageBox.StandardButton.Cancel).click()
+        else:
+            button = next((button for button in dialog.buttons()
+                           if button.text() == "Acknowledge"), None)
+            if button is None:
+                dialog.reject()
+            else:
+                button.click()
+    QTimer.singleShot(0, respond)
+    acknowledged, remembered = qt_frontend.show_photosensitivity_warning()
+    assert not observed["initially_checked"]
+    assert "seizures" in observed["text"]
+    assert "Acknowledge" in observed["buttons"]
+    assert acknowledged is not cancel
+    assert remembered is remember
+
+
+def test_photosensitivity_dialog_uses_application_theme_and_font(window):
+    app = QApplication.instance()
+    original_palette, original_font = app.palette(), app.font()
+    palette = QPalette(original_palette)
+    palette.setColor(QPalette.ColorRole.Window, QColor("white"))
+    palette.setColor(QPalette.ColorRole.WindowText, QColor("black"))
+    font = QFont(original_font)
+    font.setPointSize(19)
+    observed = {}
+    try:
+        app.setPalette(palette)
+        app.setFont(font)
+        def respond():
+            dialog = QApplication.activeModalWidget()
+            observed["window"] = dialog.palette().color(QPalette.ColorRole.Window)
+            observed["text"] = dialog.palette().color(QPalette.ColorRole.WindowText)
+            observed["font"] = dialog.checkBox().font().pointSize()
+            dialog.button(qt_frontend.QMessageBox.StandardButton.Cancel).click()
+        QTimer.singleShot(0, respond)
+        qt_frontend.show_photosensitivity_warning()
+    finally:
+        app.setPalette(original_palette)
+        app.setFont(original_font)
+    assert observed == {"window": QColor("white"), "text": QColor("black"), "font": 19}
 
 
 @pytest.mark.parametrize(
@@ -497,6 +592,7 @@ def test_disco_lights_are_steady_when_swirl_is_off(window):
 def test_disco_swirl_toggle_is_available_in_settings(window):
     dialog = SidePanel({"lightingMode": "disco"}, "visual", qt_frontend.QT_MODES,
                        lambda path: None, window)
+    assert dialog.lighting_mode.currentText() == "Lights"
     assert dialog.edge_swirl.isEnabled()
     dialog.lighting_mode.setCurrentIndex(dialog.lighting_mode.findData("none"))
     assert not dialog.edge_swirl.isEnabled()
@@ -811,7 +907,7 @@ def test_halo_scales_to_available_space_and_uses_scope_style(window, monkeypatch
         visualizer.grab()
     bounds, halo_colors = strokes[-1]
     bottom, available = visualizer.halo_layout()
-    overlay = window.play_button if controls_visible else window.track_title
+    overlay = window.track_title
     assert bottom == visualizer.mapFromGlobal(overlay.mapToGlobal(QPoint(0, 0))).y() - 8
     assert bounds.width() == pytest.approx(available * .9)
     assert bounds.height() == pytest.approx(available * .9)
@@ -827,8 +923,38 @@ def test_halo_scales_to_available_space_and_uses_scope_style(window, monkeypatch
     assert strokes[-1][1] == halo_colors
 
 
+@pytest.mark.parametrize("size", [(640, 420), (1100, 720)])
+@pytest.mark.parametrize("mode", [0, 1, 2, 4, 5])
+def test_effects_keep_their_layout_when_controls_toggle(window, monkeypatch, size, mode):
+    window.resize(*size)
+    window.hide_controls()
+    window.controls_timer.stop()
+    QApplication.processEvents()
+    visualizer = window.visualizer
+    window.edge_border.opacity = 0
+    now = qt_frontend.time.monotonic()
+    monkeypatch.setattr(qt_frontend.time, "monotonic", lambda: now)
+    visualizer.set_state({
+        "track": {"status": "playing"}, "visualizerMode": mode,
+        "artworkMode": "logo", "bars": [.4] * 24,
+        "wave": [math.sin(index * .2) * .5 for index in range(64)],
+    })
+    visualizer.frame_timer.stop()
+
+    def image():
+        if isinstance(visualizer, qt_frontend.GPUVisualizerWidget):
+            return visualizer.grabFramebuffer()
+        return visualizer.grab().toImage()
+
+    hidden = image()
+    window.show_controls()
+    window.controls_timer.stop()
+    QApplication.processEvents()
+    assert image() == hidden
+
+
 def test_halo_mode_is_available_in_visual_effects(window, monkeypatch):
-    assert (2, "WMP Halo") in qt_frontend.QT_MODES
+    assert (2, "Halo") in qt_frontend.QT_MODES
     actions = []
     monkeypatch.setattr(window.backend, "update_setting",
                         lambda name, value, source_id=None: actions.append((name, value)))
@@ -855,7 +981,7 @@ def test_spectrum_bars_respond_to_audio_and_clear_when_paused(window, monkeypatc
     playing = image()
     width, height = visualizer.width(), visualizer.height()
     x = int(width * .08 + width * .84 / 48)
-    bottom = height - (220 if visualizer.controls_visible else 112)
+    bottom = height - 112
     y = int(bottom - max(180, bottom - 72) * .3)
     assert visualizer.peaks[0] == 1
 
@@ -893,6 +1019,36 @@ def test_scope_renders_waveform_and_clears_it_when_paused(window, width):
 
     assert playing != paused
     assert window.visualizer.smoothed_wave == []
+
+
+def test_scope_zero_line_can_be_hidden_without_hiding_waveform(window):
+    visualizer = window.visualizer
+    visualizer.fallback_pixmap = None
+    state = {"track": {"status": "paused"}, "visualizerMode": 1, "artworkMode": "none"}
+    visualizer.set_state(state)
+    with_line = visualizer.grab().toImage()
+    visualizer.set_state({**state, "scopeZeroLine": False})
+    without_line = visualizer.grab().toImage()
+    assert with_line != without_line
+
+    visualizer.set_state({**state, "scopeZeroLine": False,
+                          "track": {"status": "playing"}, "wave": [.5] * 64})
+    assert visualizer.grab().toImage() != without_line
+    visualizer.set_state({**state, "scopeZeroLine": True})
+    assert visualizer.grab().toImage() == with_line
+
+
+def test_scope_zero_line_visual_setting_applies_and_resets(window, monkeypatch):
+    actions = []
+    monkeypatch.setattr(window.backend, "update_setting",
+                        lambda name, value, source_id=None: actions.append((name, value)))
+    window.open_mode_menu()
+    panel = window.side_panel
+    assert panel.scope_zero_line.isChecked()
+    panel.scope_zero_line.setChecked(False)
+    assert actions == [("scope-zero-line", False)]
+    panel.reset_button.click()
+    assert actions[-1] == ("scope-zero-line", True)
 
 
 def test_scope_interpolates_between_audio_updates_and_stops_when_paused(window):
@@ -988,19 +1144,93 @@ def test_background_radial_gradient_has_expected_geometry(window, size):
         assert abs(image.pixelColor(x, y).red() - expected_red) < 4
 
 
-def test_double_click_and_escape_toggle_fullscreen(window):
-    QTest.mouseDClick(window.visualizer, Qt.MouseButton.LeftButton, pos=QPoint(100, 100))
+def test_f11_and_escape_toggle_fullscreen(window):
+    QTest.keyClick(window, Qt.Key.Key_F)
+    assert not window.isFullScreen()
+    QTest.keyClick(window, Qt.Key.Key_F11)
     assert window.isFullScreen()
     QTest.keyClick(window, Qt.Key.Key_Escape)
     assert not window.isFullScreen()
+    QTest.keyClick(window, Qt.Key.Key_F11)
+    QTest.keyClick(window, Qt.Key.Key_F11)
+    assert not window.isFullScreen()
+
+
+@pytest.mark.parametrize("fraction,kind", [(0, "visual"), (1, "visual"),
+                                          (2, "settings"), (3, "settings")])
+def test_screen_side_click_opens_panel(window, fraction, kind):
+    width = window.visualizer.width()
+    x = (1, (width - 1) // 3, (width * 2 + 2) // 3, width - 1)[fraction]
+    QTest.mouseClick(window.visualizer, Qt.MouseButton.LeftButton, pos=QPoint(x, 100))
+    assert window.side_panel.kind == kind
+
+
+def test_middle_double_click_cycles_and_wraps_modes(window, monkeypatch):
+    actions = []
+    monkeypatch.setattr(window.backend, "update_setting",
+                        lambda name, value, source_id=None: actions.append((name, value)))
+    position = QPoint(window.visualizer.width() // 2, 100)
+    QTest.mouseClick(window.visualizer, Qt.MouseButton.LeftButton, pos=position)
+    assert window.side_panel is None and not actions
+    for _ in qt_frontend.QT_MODES:
+        QTest.mouseDClick(window.visualizer, Qt.MouseButton.LeftButton, pos=position)
+    assert actions == [("visualizer-mode", mode) for mode in (1, 2, 4, 5, 0)]
+    assert window.state["visualizerMode"] == 0
+    assert not window.isFullScreen()
+
+
+def test_middle_double_click_follows_a_panel_mode_selection(window, monkeypatch):
+    actions = []
+    monkeypatch.setattr(window.backend, "update_setting",
+                        lambda name, value, source_id=None: actions.append((name, value)))
+    window.open_mode_menu()
+    panel = window.side_panel
+    panel.mode.setCurrentIndex(panel.mode.findData(2))
+    panel.close_button.click()
+    wait_for_panel_animation(window)
+    QTest.mouseDClick(window.visualizer, Qt.MouseButton.LeftButton,
+                      pos=QPoint(window.visualizer.width() // 2, 100))
+    assert actions == [("visualizer-mode", 2), ("visualizer-mode", 4)]
+
+
+def test_side_double_click_does_not_toggle_fullscreen(window):
+    position = QPoint(10, 100)
+    QTest.mouseClick(window.visualizer, Qt.MouseButton.LeftButton, pos=position)
+    QTest.mouseDClick(window.visualizer, Qt.MouseButton.LeftButton, pos=position)
+    assert window.side_panel.kind == "visual"
+    assert not window.isFullScreen()
+
+
+def test_screen_click_in_empty_controls_container_opens_panel(window):
+    container = window.controls_container
+    QTest.mouseClick(container, Qt.MouseButton.LeftButton, pos=QPoint(1, 5))
+    assert window.side_panel.kind == "visual"
+
+
+def test_middle_double_click_reports_failed_mode_change(window, monkeypatch):
+    def fail(*_args):
+        raise OSError("disk full")
+    warnings = []
+    monkeypatch.setattr(window.backend, "update_setting", fail)
+    monkeypatch.setattr(qt_frontend.QMessageBox, "warning",
+                        lambda *args: warnings.append(args))
+    QTest.mouseDClick(window.visualizer, Qt.MouseButton.LeftButton,
+                      pos=QPoint(window.visualizer.width() // 2, 100))
+    assert "disk full" in warnings[0][2]
+    assert window.state.get("visualizerMode", 0) == 0
+
+
+def test_right_click_does_not_open_a_panel(window):
+    QTest.mouseClick(window.visualizer, Qt.MouseButton.RightButton, pos=QPoint(10, 100))
+    assert window.side_panel is None
 
 
 def test_state_refresh_updates_selected_source_without_sending_action(window, monkeypatch):
     state = {
         "track": {},
-        "sources": [{"id": "bluetooth", "label": "Bluetooth"},
+        "sources": [{"id": "mpris:org.mpris.MediaPlayer2.first", "label": "First"},
                     {"id": "other", "label": "Other"}],
-        "selectedSource": "bluetooth",
+        "selectedSource": "mpris:org.mpris.MediaPlayer2.first",
     }
     actions = []
     monkeypatch.setattr(window.backend, "get_state", lambda: state)
@@ -1018,9 +1248,9 @@ def test_state_refresh_updates_selected_source_without_sending_action(window, mo
 
 def test_source_menu_shows_selected_source_and_switches(window, monkeypatch):
     window.state = {
-        "sources": [{"id": "bluetooth", "label": "Bluetooth"},
+        "sources": [{"id": "mpris:org.mpris.MediaPlayer2.first", "label": "First"},
                     {"id": "mpris:org.mpris.MediaPlayer2.player", "label": "Player"}],
-        "selectedSource": "bluetooth",
+        "selectedSource": "mpris:org.mpris.MediaPlayer2.first",
     }
     calls = []
     monkeypatch.setattr(window.backend, "set_source", lambda source: (calls.append(source) or True, ""))
@@ -1030,7 +1260,7 @@ def test_source_menu_shows_selected_source_and_switches(window, monkeypatch):
             assert position == window.source_button.mapToGlobal(QPoint(0, -self.sizeHint().height()))
             actions = self.actions()
             assert [(action.text(), action.isChecked()) for action in actions] == [
-                ("Bluetooth", True), ("Player", False),
+                ("First", True), ("Player", False),
             ]
             actions[1].trigger()
 
@@ -1042,14 +1272,14 @@ def test_source_menu_shows_selected_source_and_switches(window, monkeypatch):
 
 
 @pytest.mark.parametrize("selected,status,expected", [
-    ("bluetooth", "playing", True),
-    ("bluetooth", "paused", False),
+    ("mpris:org.mpris.MediaPlayer2.first", "playing", True),
+    ("mpris:org.mpris.MediaPlayer2.first", "paused", False),
     ("mpris:org.mpris.MediaPlayer2.player", "playing", False),
 ])
 def test_qt_startup_prefers_playing_computer_app_once(window, monkeypatch, selected, status, expected):
     state = {
         "track": {},
-        "sources": [{"id": "bluetooth", "label": "Bluetooth", "status": "paused"},
+        "sources": [{"id": "mpris:org.mpris.MediaPlayer2.first", "label": "First", "status": "paused"},
                     {"id": "mpris:org.mpris.MediaPlayer2.player",
                      "label": "Player", "status": status}],
         "selectedSource": selected,
@@ -1072,7 +1302,7 @@ def test_source_selection_reports_failure(window, monkeypatch):
     monkeypatch.setattr(window.backend, "set_source", fail)
     monkeypatch.setattr(qt_frontend.QMessageBox, "warning",
                         lambda parent, title, message: warnings.append(message))
-    window.change_source("bluetooth")
+    window.change_source("mpris:org.mpris.MediaPlayer2.other")
     assert warnings == ["Source could not be changed: unavailable"]
 
 
@@ -1081,7 +1311,7 @@ def test_source_selection_reports_backend_warning(window, monkeypatch):
     monkeypatch.setattr(window.backend, "set_source", lambda source: (True, "Unable to pause"))
     monkeypatch.setattr(qt_frontend.QMessageBox, "warning",
                         lambda parent, title, message: warnings.append(message))
-    window.change_source("bluetooth")
+    window.change_source("mpris:org.mpris.MediaPlayer2.other")
     assert warnings == ["Unable to pause"]
 
 
@@ -1224,7 +1454,7 @@ def test_visual_panel_sync_does_not_send_requests(window, monkeypatch):
 
 def test_reset_restores_all_visual_settings(window):
     state = {
-        "visualizerMode": 2, "artworkMode": "logo", "albumArtOpacity": 60,
+        "visualizerMode": 2, "scopeZeroLine": False, "artworkMode": "logo", "albumArtOpacity": 60,
         "lightingMode": "disco", "lightingColorMode": "rainbow", "edgeSwirl": True,
         "edgeColorIntensity": 40, "edgeFade": 20, "edgeOpacity": 80,
         "edgeColorCount": 3, "edgeDepth": 150, "discoLightCount": 20,
@@ -1275,6 +1505,45 @@ def test_settings_save_cancel_and_failure(window, monkeypatch):
     assert "connection failed" in panel.status.text()
 
 
+@pytest.mark.parametrize("initial", [True, False])
+def test_startup_warning_setting_respects_discard_and_save(window, monkeypatch, initial):
+    window.state["showPhotosensitivityWarning"] = initial
+    actions = []
+    monkeypatch.setattr(window.backend, "update_setting",
+                        lambda name, value, source_id=None: actions.append((name, value)))
+    monkeypatch.setattr(qt_frontend.QMessageBox, "question",
+                        lambda *args: qt_frontend.QMessageBox.StandardButton.Discard)
+    window.open_settings()
+    panel = window.side_panel
+    assert panel.content_layout.itemAt(panel.content_layout.count() - 2).widget() is panel.show_photosensitivity_warning
+    assert panel.show_photosensitivity_warning.isChecked() is initial
+    panel.show_photosensitivity_warning.setChecked(not initial)
+    assert panel.has_unsaved_settings()
+    panel.cancel_button.click()
+    wait_for_panel_animation(window)
+    assert actions == []
+    window.open_settings()
+    panel = window.side_panel
+    assert panel.show_photosensitivity_warning.isChecked() is initial
+    panel.show_photosensitivity_warning.setChecked(not initial)
+    panel.save_button.click()
+    assert actions == [("show-photosensitivity-warning", not initial)]
+    assert window.state["showPhotosensitivityWarning"] is not initial
+
+
+def test_startup_warning_setting_reports_save_failure(window, monkeypatch):
+    def fail(*args):
+        raise OSError("disk full")
+    monkeypatch.setattr(window.backend, "update_setting", fail)
+    window.open_settings()
+    panel = window.side_panel
+    panel.show_photosensitivity_warning.setChecked(False)
+    panel.save_button.click()
+    assert window.side_panel is panel
+    assert panel.has_unsaved_settings()
+    assert "disk full" in panel.status.text()
+
+
 def test_settings_save_source_system_volume_and_per_source_boost(window, monkeypatch):
     first = "mpris:org.mpris.MediaPlayer2.first"
     second = "mpris:org.mpris.MediaPlayer2.second"
@@ -1293,10 +1562,9 @@ def test_settings_save_source_system_volume_and_per_source_boost(window, monkeyp
     assert panel.source_gain.value() == 20
     panel.source_gain.setValue(30)
     panel.system_volume.setValue(65)
-    panel.bluetooth_enabled.setChecked(True)
     panel.save_button.click()
     assert actions == [
-        ("bluetooth-enabled", True, None), ("source", second, None),
+        ("source", second, None),
         ("system-volume", 65, None), ("source-gain", 2.0, first),
         ("source-gain", 3.0, second),
     ]
@@ -1542,11 +1810,20 @@ def test_escape_closes_panel_without_exiting_fullscreen(window):
     assert window.isFullScreen()
 
 
+def test_f11_works_with_focused_panel_control(window):
+    window.open_mode_menu()
+    panel = window.side_panel
+    panel.mode.setFocus()
+    QTest.keyClick(panel.mode, Qt.Key.Key_F11)
+    assert window.isFullScreen()
+
+
 @pytest.mark.parametrize("kind", ["visual", "settings"])
 def test_side_panel_uses_blue_to_black_gradient(window, kind):
     window.open_side_panel(kind)
     wait_for_panel_animation(window)
     panel = window.side_panel
+    panel.scroll.hide()
     image = panel.grab().toImage()
     center = image.pixelColor(panel.width() // 2, panel.height() // 2)
     edge = image.pixelColor(10, panel.height() // 2)
@@ -1845,13 +2122,11 @@ def test_gpu_failure_restores_cpu_visualizer(window, capsys):
     if not isinstance(old, qt_frontend.GPUVisualizerWidget):
         pytest.skip("hardware OpenGL widget unavailable")
     old.set_state({"visualizerMode": 1, "track": {"status": "playing"}, "wave": [0.2, 0.4]})
-    old.controls_visible = False
     window.edge_border.angle = 40
     window.fallback_visualizer("shader failure")
     QApplication.processEvents()
     assert isinstance(window.visualizer, qt_frontend.VisualizerWidget)
     assert window.visualizer.state["wave"] == [0.2, 0.4]
-    assert not window.visualizer.controls_visible
     assert window.visualizer.frame_timer.isActive()
     assert window.edge_border.parent() is window.visualizer
     assert window.edge_border.isVisible()

@@ -244,6 +244,11 @@ class SidePanel(QWidget):
         self.section("Visualisation")
         self.mode = self.combo("Visualisation mode", modes, state.get("visualizerMode", 0))
         self.bind("visualizerMode", self.mode, 0, "visualizer-mode", self.mode.currentData())
+        self.scope_zero_line = QCheckBox("Show scope zero line")
+        self.scope_zero_line.setChecked(bool(state.get("scopeZeroLine", True)))
+        self.content_layout.addWidget(self.scope_zero_line)
+        self.bind("scopeZeroLine", self.scope_zero_line, True, "scope-zero-line",
+                  self.scope_zero_line.isChecked())
 
         self.section("Artwork")
         self.artwork_mode = self.combo("Artwork", [
@@ -258,7 +263,7 @@ class SidePanel(QWidget):
 
         self.section("Lighting")
         self.lighting_mode = self.combo("Lighting", [
-            ("border", "Edge lighting"), ("disco", "Disco lights"), ("none", "None"),
+            ("border", "Edge lighting"), ("disco", "Lights"), ("none", "None"),
         ], state.get("lightingMode", "border"))
         self.bind("lightingMode", self.lighting_mode, "border", "lighting-mode",
                   self.lighting_mode.currentData())
@@ -267,7 +272,7 @@ class SidePanel(QWidget):
         ], state.get("lightingColorMode", "artwork"))
         self.bind("lightingColorMode", self.lighting_color_mode, "artwork", "lighting-color-mode",
                   self.lighting_color_mode.currentData())
-        self.edge_swirl = QCheckBox("Swirl edges / animate disco lights to music")
+        self.edge_swirl = QCheckBox("Swirl edges / animate lights to music")
         self.edge_swirl.setAccessibleName("Animate lighting")
         self.edge_swirl.setChecked(bool(state.get("edgeSwirl", False)))
         self.content_layout.addWidget(self.edge_swirl)
@@ -291,10 +296,10 @@ class SidePanel(QWidget):
             setattr(self, name + "_value", output)
             self.bind(key, slider, default, path, slider.value())
 
-        self.section("Disco lights")
+        self.section("Lights")
         for name, key, title, minimum, maximum, default, path, formatter in (
-            ("disco_count", "discoLightCount", "Disco light count", 3, 40, 16, "disco-light-count", str),
-            ("disco_size", "discoLightSize", "Disco light size", 40, 200, 100, "disco-light-size",
+            ("disco_count", "discoLightCount", "Light count", 3, 40, 16, "disco-light-count", str),
+            ("disco_size", "discoLightSize", "Light size", 40, 200, 100, "disco-light-size",
              lambda v: f"{v}%"),
         ):
             slider, output = self.slider(title, minimum, maximum, int(state.get(key, default)), formatter)
@@ -319,9 +324,6 @@ class SidePanel(QWidget):
 
     def build_settings(self, state):
         self.section("Audio")
-        self.bluetooth_enabled = QCheckBox("Show Bluetooth source when available")
-        self.bluetooth_enabled.setChecked(bool(state.get("bluetoothEnabled", False)))
-        self.content_layout.addWidget(self.bluetooth_enabled)
         self.source = self.combo(
             "Playback source",
             [(item["id"], item["label"]) for item in state.get("sources", [])],
@@ -349,7 +351,11 @@ class SidePanel(QWidget):
         ], int(state.get("sampleRate", 48000)))
         self.help_text("Lower rates can reduce capture load; 22.05 kHz limits the visualiser's top frequency.")
         self.saved_rate = self.sample_rate.currentData()
-        self.saved_bluetooth_enabled = self.bluetooth_enabled.isChecked()
+        self.section("Startup")
+        self.show_photosensitivity_warning = QCheckBox("Show photosensitivity warning on startup")
+        self.show_photosensitivity_warning.setChecked(state.get("showPhotosensitivityWarning", True))
+        self.content_layout.addWidget(self.show_photosensitivity_warning)
+        self.saved_show_photosensitivity_warning = self.show_photosensitivity_warning.isChecked()
 
     def update_source_gain(self, value):
         source = self.source.currentData()
@@ -362,8 +368,8 @@ class SidePanel(QWidget):
         self.set_field_silently(self.source_gain, round(self.source_gains.get(source, 1.0) * 10))
 
     def has_unsaved_settings(self):
-        return (self.sample_rate.currentData() != self.saved_rate
-                or self.bluetooth_enabled.isChecked() != self.saved_bluetooth_enabled
+        return (self.show_photosensitivity_warning.isChecked() != self.saved_show_photosensitivity_warning
+                or self.sample_rate.currentData() != self.saved_rate
                 or self.source.currentData() != self.saved_source
                 or self.system_volume.isEnabled() and self.system_volume.value() != self.saved_system_volume
                 or any(value != self.saved_gains.get(source, 1.0)
@@ -372,9 +378,9 @@ class SidePanel(QWidget):
     def apply_settings(self):
         self.status.clear()
         try:
-            if self.bluetooth_enabled.isChecked() != self.saved_bluetooth_enabled:
-                self.request("bluetooth-enabled", self.bluetooth_enabled.isChecked())
-                self.saved_bluetooth_enabled = self.bluetooth_enabled.isChecked()
+            if self.show_photosensitivity_warning.isChecked() != self.saved_show_photosensitivity_warning:
+                self.request("show-photosensitivity-warning", self.show_photosensitivity_warning.isChecked())
+                self.saved_show_photosensitivity_warning = self.show_photosensitivity_warning.isChecked()
             if self.sample_rate.currentData() != self.saved_rate:
                 self.request("sample-rate", self.sample_rate.currentData())
                 self.saved_rate = self.sample_rate.currentData()

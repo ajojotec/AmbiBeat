@@ -29,6 +29,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QGraphicsOpacityEffect,
     QHBoxLayout,
     QLabel,
@@ -51,9 +52,9 @@ from .qt_panels import SidePanel, WheelIgnoringSlider
 
 
 QT_MODES = (
-    (0, "WMP Bars"),
-    (1, "WMP Scope"),
-    (2, "WMP Halo"),
+    (0, "Bars"),
+    (1, "Scope"),
+    (2, "Halo"),
     (4, "Time Vortex"),
     (5, "No visualisation"),
 )
@@ -243,7 +244,6 @@ class VisualizerRenderer:
         self.background_size = None
         self.halo_fade_key = None
         self.halo_fade_texture = None
-        self.controls_visible = True
         self.peaks = []
         self.smoothed_bars = []
         self.smoothed_wave = []
@@ -315,7 +315,7 @@ class VisualizerRenderer:
         if self.state.get("visualizerMode", 0) == 2:
             self.update()
             return
-        layout_bottom = self.height() - (220 if self.controls_visible else 112)
+        layout_bottom = self.height() - 112
         layout_height = max(180, layout_bottom - 72)
         self.update(QRect(24, 72, max(1, self.width() - 48), layout_height))
 
@@ -490,12 +490,11 @@ class VisualizerRenderer:
         width, height = self.width(), self.height()
         center_y = height / 2
         window = self.window()
-        overlay = (getattr(window, "play_button", None) if self.controls_visible else
-                   getattr(window, "track_title", None))
+        overlay = getattr(window, "track_title", None)
         if overlay is not None:
             bottom = self.mapFromGlobal(overlay.mapToGlobal(QPoint(0, 0))).y() - 8
         else:
-            bottom = height - (220 if self.controls_visible else 112)
+            bottom = height - 112
         half_height = max(1, min(center_y - 72, bottom - center_y))
         return bottom, min(max(1, width - 48), 2 * half_height)
 
@@ -504,7 +503,7 @@ class VisualizerRenderer:
         width = self.width()
         height = self.height()
         layout_top = 72
-        layout_bottom = height - (220 if self.controls_visible else 112)
+        layout_bottom = height - 112
         layout_height = max(180, layout_bottom - layout_top)
         layout_center_y = layout_top + layout_height * 0.5
         layout_left = 24
@@ -621,10 +620,11 @@ class VisualizerRenderer:
 
         elif qt_mode == 1:
             gradient = scope_gradient(width, active_palette)
-            painter.setOpacity(.78)
-            painter.setPen(QPen(gradient, 1.25))
-            painter.drawLine(int(width * .08), int(layout_center_y),
-                             int(width * .92), int(layout_center_y))
+            if self.state.get("scopeZeroLine", True):
+                painter.setOpacity(.78)
+                painter.setPen(QPen(gradient, 1.25))
+                painter.drawLine(int(width * .08), int(layout_center_y),
+                                 int(width * .92), int(layout_center_y))
             if len(wave) > 1:
                 scale = 1 if isinstance(self, QOpenGLWidget) else min(1.0, 960 / width)
                 if scale < 1:
@@ -1043,6 +1043,7 @@ class AmbiBeatQtWindow(QMainWindow):
         controls.addWidget(self.fullscreen_button)
         controls.addStretch()
         controls_widget = QWidget()
+        self.controls_container = controls_widget
         controls_widget.setObjectName("controlsContainer")
         controls_widget.setStyleSheet("QWidget#controlsContainer { background: transparent; }")
         controls_widget.setLayout(controls)
@@ -1111,7 +1112,7 @@ class AmbiBeatQtWindow(QMainWindow):
         print(f"Qt GPU rendering failed ({reason}); using CPU rendering.", file=sys.stderr)
         replacement = VisualizerWidget()
         for name in (
-            "state", "art_pixmap", "track_palette", "logo_palette", "controls_visible", "peaks",
+            "state", "art_pixmap", "track_palette", "logo_palette", "peaks",
             "smoothed_bars", "smoothed_wave", "last_frame", "vortex_beat",
             "previous_bass", "last_beat", "beat_intervals", "vortex_pitch",
         ):
@@ -1131,6 +1132,7 @@ class AmbiBeatQtWindow(QMainWindow):
         replacement.show()
 
     def eventFilter(self, watched, event):
+        background = watched in (self.visualizer, self.centralWidget(), self.controls_container)
         if (event.type() == QEvent.Type.MouseButtonPress
                 and self.side_panel is not None
                 and watched is not (self.mode_button if self.side_panel.kind == "visual"
@@ -1141,9 +1143,25 @@ class AmbiBeatQtWindow(QMainWindow):
                 )):
             if not self.close_side_panel():
                 return True
+            if background:
+                return True
         if (event.type() == QEvent.Type.KeyPress and event.key() == Qt.Key.Key_Escape
                 and self.side_panel is not None):
             self.close_side_panel()
+            return True
+        if (background and event.type() in (QEvent.Type.MouseButtonPress,
+                                            QEvent.Type.MouseButtonDblClick)
+                and event.button() == Qt.MouseButton.LeftButton):
+            if self.side_panel is None:
+                central = self.centralWidget()
+                x = central.mapFromGlobal(event.globalPosition().toPoint()).x()
+                if event.type() == QEvent.Type.MouseButtonPress:
+                    if x * 3 < central.width():
+                        self.open_mode_menu()
+                    elif x * 3 >= central.width() * 2:
+                        self.open_settings()
+                elif central.width() <= x * 3 < central.width() * 2:
+                    self.next_visualizer_mode()
             return True
         if event.type() == QEvent.Type.MouseMove:
             self.show_controls()
@@ -1200,16 +1218,12 @@ class AmbiBeatQtWindow(QMainWindow):
             self.controls_timer.start(2500)
         else:
             self.controls_timer.stop()
-        self.visualizer.controls_visible = True
-        self.visualizer.update()
         self.position_metadata()
 
     def hide_controls(self):
         if self.side_panel is not None:
             return
         self.controls_effect.setOpacity(0)
-        self.visualizer.controls_visible = False
-        self.visualizer.update()
         self.position_metadata()
 
     def hide_fullscreen_cursor(self):
@@ -1274,11 +1288,14 @@ class AmbiBeatQtWindow(QMainWindow):
             )
             central.layout().invalidate()
 
-    def mouseDoubleClickEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.toggle_fullscreen()
-        else:
-            super().mouseDoubleClickEvent(event)
+    def next_visualizer_mode(self):
+        modes = [mode for mode, _label in QT_MODES]
+        current = self.state.get("visualizerMode", 0)
+        next_mode = modes[(modes.index(current) + 1) % len(modes)]
+        try:
+            self.panel_request("visualizer-mode", next_mode)
+        except (OSError, ValueError, RuntimeError) as error:
+            QMessageBox.warning(self, "Visualisation", f"Visualisation could not be changed: {error}")
 
     def keyPressEvent(self, event):
         self.show_controls()
@@ -1293,7 +1310,7 @@ class AmbiBeatQtWindow(QMainWindow):
         elif key in (Qt.Key.Key_Space,):
             status = (self.state.get("track") or {}).get("status")
             self.media_control("Pause" if status == "playing" else "Play")
-        elif key in (Qt.Key.Key_F,):
+        elif key == Qt.Key.Key_F11:
             self.toggle_fullscreen()
         elif key == Qt.Key.Key_Escape and self.isFullScreen():
             self.toggle_fullscreen()
@@ -1473,6 +1490,11 @@ class AmbiBeatQtWindow(QMainWindow):
             warning = self.backend.update_setting(name, value, source_id)
         except (dbus.DBusException, subprocess.SubprocessError) as error:
             raise RuntimeError(str(error)) from error
+        if name == "visualizer-mode":
+            self.state = {**self.state, "visualizerMode": value}
+            self.visualizer.set_state(self.state)
+        elif name == "show-photosensitivity-warning":
+            self.state = {**self.state, "showPhotosensitivityWarning": value}
         if warning:
             QMessageBox.warning(self, "Playback source", warning)
 
@@ -1563,6 +1585,23 @@ class AmbiBeatQtWindow(QMainWindow):
             self.show_fullscreen_cursor()
 
 
+def show_photosensitivity_warning():
+    dialog = QMessageBox()
+    dialog.setIcon(QMessageBox.Icon.Warning)
+    dialog.setWindowTitle("Photosensitivity warning")
+    dialog.setText(
+        "AmbiBeat's visual effects can flash or change rapidly. "
+        "They may trigger seizures or discomfort in people sensitive to flashing lights."
+    )
+    remember = QCheckBox("Remember my acknowledgement")
+    dialog.setCheckBox(remember)
+    acknowledge = dialog.addButton("Acknowledge", QMessageBox.ButtonRole.AcceptRole)
+    dialog.addButton(QMessageBox.StandardButton.Cancel)
+    dialog.setDefaultButton(acknowledge)
+    dialog.exec()
+    return dialog.clickedButton() is acknowledge, remember.isChecked()
+
+
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName("AmbiBeat")
@@ -1581,7 +1620,6 @@ def main():
     palette.setColor(QPalette.ColorRole.Highlight, QColor("#8d82d8"))
     palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
     palette.setColor(QPalette.ColorRole.BrightText, QColor("#d8e7ff"))
-    app.setPalette(palette)
     settings_dir = os.path.join(
         os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config"),
         "ambibeat",
@@ -1598,12 +1636,7 @@ def main():
             return 1
         dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
         session_bus = dbus.SessionBus()
-        try:
-            system_bus = dbus.SystemBus()
-        except dbus.DBusException as error:
-            print(f"System D-Bus unavailable; Bluetooth source disabled: {error}", file=sys.stderr)
-            system_bus = None
-        backend = AmbiBeatBackend(session_bus, system_bus)
+        backend = AmbiBeatBackend(session_bus)
     except (OSError, dbus.DBusException, RuntimeError) as error:
         QMessageBox.critical(None, "AmbiBeat", f"Could not start AmbiBeat: {error}")
         return 1
@@ -1611,6 +1644,19 @@ def main():
         if lock_file is not None and backend is None:
             lock_file.close()
     try:
+        if not backend.photosensitivity_warning_acknowledged:
+            acknowledged, remember = show_photosensitivity_warning()
+            if not acknowledged:
+                return 0
+            if remember:
+                try:
+                    backend.acknowledge_photosensitivity_warning()
+                except OSError as error:
+                    QMessageBox.critical(
+                        None, "AmbiBeat", f"Could not save the warning acknowledgement: {error}",
+                    )
+                    return 1
+        app.setPalette(palette)
         window = AmbiBeatQtWindow(backend)
         window.show()
         signal.signal(signal.SIGINT, lambda *_args: app.quit())

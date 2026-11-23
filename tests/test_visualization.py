@@ -66,42 +66,6 @@ def test_spectrum_bars_respond_to_different_frequency_tones():
     assert max(high[20:]) > .5 and max(high[:6]) < .02
 
 
-def test_source_switch_pauses_and_resumes_bluetooth():
-    backend = MODULE.AmbiBeatBackend.__new__(MODULE.AmbiBeatBackend)
-    mpris_source = "mpris:org.mpris.MediaPlayer2.player"
-    bus_name = "org.mpris.MediaPlayer2.player"
-    backend.selected_source = "bluetooth"
-    backend.bluetooth_available = True
-    backend._source_choice_made = False
-    backend.bluetooth_track_info = {"status": "playing"}
-    backend._bluetooth_art_url = ""
-    backend._mpris_players = {
-        bus_name: {
-            "id": mpris_source,
-            "track": {"title": "Track", "artist": "Artist", "album": "", "status": "paused"},
-            "art_url": "",
-        }
-    }
-    backend._publish_track = lambda *_args: None
-    backend.source_volume = SimpleNamespace(
-        lock=threading.RLock(), restore=lambda: None, apply=lambda source: None,
-    )
-    backend._save_settings = lambda: None
-    actions = []
-    backend._bluetooth_control_warning = lambda action: actions.append(action) or ""
-    mpris_actions = []
-    backend._mpris_control_warning = (
-        lambda source, action: mpris_actions.append((source, action)) or ""
-    )
-
-    switched, _ = backend.set_source(mpris_source)
-    resumed, _ = backend.set_source("bluetooth")
-
-    assert switched and resumed
-    assert actions == ["Pause", "Play"]
-    assert mpris_actions == [(mpris_source, "Play")]
-
-
 def test_source_gain_accepts_only_supported_range():
     backend = MODULE.AmbiBeatBackend.__new__(MODULE.AmbiBeatBackend)
     backend.selected_source = "mpris:org.mpris.MediaPlayer2.player"
@@ -113,6 +77,7 @@ def test_source_gain_accepts_only_supported_range():
     assert backend.set_source_gain(backend.selected_source, 2.4)
     assert backend.set_source_gain(backend.selected_source, 4.0)
     assert not backend.set_source_gain(backend.selected_source, 4.1)
+    assert not backend.set_source_gain("bluetooth", 2.0)
     assert backend.source_volume.gains[backend.selected_source] == 4.0
 
 
@@ -128,44 +93,14 @@ def test_source_gain_is_remembered_if_stream_is_not_yet_available():
     assert "no stream" in backend.boost_warning
 
 
-def test_bluetooth_source_is_detected_only_when_enabled():
-    backend = MODULE.AmbiBeatBackend.__new__(MODULE.AmbiBeatBackend)
-    backend.system_bus = None
-    backend.bluetooth_enabled = False
-    backend.selected_source = ""
-    backend.bluetooth_track_info = {}
-    backend.source_volume = MODULE.SourceVolume({}, {}, lambda: None, lambda _: set())
-    streams = [{"properties": {"device.api": "bluez5", "api.bluez5.profile": "a2dp-source"},
-                "corked": False}]
-    with patch.object(MODULE.subprocess, "run", return_value=SimpleNamespace(stdout=json.dumps(streams))) as run:
-        backend._refresh_bluetooth_availability()
-        assert not backend.bluetooth_available
-        run.assert_not_called()
-        backend.bluetooth_enabled = True
-        backend._refresh_bluetooth_availability()
-        assert backend.bluetooth_available
-        assert backend.bluetooth_track_info["status"] == "playing"
-        run.return_value.stdout = "[]"
-        backend._refresh_bluetooth_availability()
-        assert not backend.bluetooth_available
-
-
-def test_bluetooth_without_system_bus_reports_unavailable_controls():
-    backend = MODULE.AmbiBeatBackend.__new__(MODULE.AmbiBeatBackend)
-    backend.system_bus = None
-    backend.selected_source = "bluetooth"
-    backend.bluetooth_available = True
-    with pytest.raises(RuntimeError, match="controls are unavailable"):
-        backend.media_control("Play")
-
-
 def test_app_settings_are_saved_and_loaded_with_validated_values():
     settings = {
         "sample_rate": 96000,
-        "source_gains": {"bluetooth": 2.4},
-        "bluetooth_enabled": True,
+        "photosensitivity_warning_acknowledged": True,
+        "source_gains": {"mpris:org.mpris.MediaPlayer2.player": 2.4},
         "selected_source": "mpris:org.mpris.MediaPlayer2.player",
         "visualizer_mode": 5,
+        "scope_zero_line": False,
         "edge_swirl": True,
         "lighting_mode": "disco",
         "lighting_color_mode": "rainbow",
@@ -193,7 +128,7 @@ def test_settings_are_isolated_by_user_config_directory(tmp_path):
     code = (
         "import json, sys; from ambibeat.backend import _load_app_settings, _write_app_settings; "
         "value = int(sys.argv[1]); "
-        "_write_app_settings({'sample_rate': value}) if value else None; "
+        "_write_app_settings({'sample_rate': value, 'photosensitivity_warning_acknowledged': True}) if value else None; "
         "print(json.dumps(_load_app_settings()))"
     )
     def run(config, value):
@@ -204,9 +139,53 @@ def test_settings_are_isolated_by_user_config_directory(tmp_path):
 
     alice, bob = tmp_path / "alice", tmp_path / "bob"
     assert run(alice, 44100)["sample_rate"] == 44100
+    assert run(alice, 0)["photosensitivity_warning_acknowledged"] is True
     assert run(bob, 0) == {}
     assert run(bob, 96000)["sample_rate"] == 96000
     assert run(alice, 0)["sample_rate"] == 44100
+
+
+def test_photosensitivity_warning_acknowledgement_is_saved_and_validated(tmp_path, monkeypatch):
+    path = tmp_path / "settings.json"
+    monkeypatch.setattr(MODULE, "APP_SETTINGS_PATH", str(path))
+    monkeypatch.setattr(MODULE, "LEGACY_APP_SETTINGS_PATH", str(tmp_path / "legacy.json"))
+    monkeypatch.setattr(MODULE, "ART_CACHE_DIR", str(tmp_path / "art"))
+    monkeypatch.setattr(MODULE.AmbiBeatBackend, "_refresh_system_volume", lambda self: True)
+    bus = SimpleNamespace(list_names=lambda: [])
+    backend = MODULE.AmbiBeatBackend(bus)
+    try:
+        assert not backend.photosensitivity_warning_acknowledged
+        assert backend.get_state()["showPhotosensitivityWarning"]
+        backend.acknowledge_photosensitivity_warning()
+        assert MODULE._load_app_settings()["photosensitivity_warning_acknowledged"] is True
+        assert not backend.get_state()["showPhotosensitivityWarning"]
+        backend.update_setting("show-photosensitivity-warning", True)
+        assert MODULE._load_app_settings()["photosensitivity_warning_acknowledged"] is False
+        assert backend.get_state()["showPhotosensitivityWarning"]
+        with pytest.raises(ValueError):
+            backend.update_setting("show-photosensitivity-warning", "yes")
+        backend.update_setting("show-photosensitivity-warning", False)
+    finally:
+        backend.stop()
+    backend = MODULE.AmbiBeatBackend(bus)
+    try:
+        assert backend.photosensitivity_warning_acknowledged
+    finally:
+        backend.stop()
+    path.write_text(json.dumps({"photosensitivity_warning_acknowledged": 1}), encoding="utf-8")
+    assert MODULE._load_app_settings() == {}
+
+
+def test_photosensitivity_warning_acknowledgement_rolls_back_on_save_failure():
+    backend = MODULE.AmbiBeatBackend.__new__(MODULE.AmbiBeatBackend)
+    backend.photosensitivity_warning_acknowledged = False
+    backend.source_volume = SimpleNamespace(lock=threading.RLock())
+    def fail_save():
+        raise OSError("disk full")
+    backend._save_settings = fail_save
+    with pytest.raises(OSError, match="disk full"):
+        backend.acknowledge_photosensitivity_warning()
+    assert not backend.photosensitivity_warning_acknowledged
 
 
 def test_backend_stop_retries_failed_volume_restoration(monkeypatch):
@@ -243,18 +222,41 @@ def test_backend_starts_and_stops(tmp_path, monkeypatch):
     monkeypatch.setattr(MODULE, "_load_app_settings", lambda: {})
     monkeypatch.setattr(MODULE.AmbiBeatBackend, "_refresh_system_volume", lambda self: True)
     bus = SimpleNamespace(list_names=lambda: [])
-    backend = MODULE.AmbiBeatBackend(bus, None)
+    backend = MODULE.AmbiBeatBackend(bus)
     try:
         backend.activate()
         assert backend.source_volume.active
         assert backend._glib_thread.is_alive()
         assert backend.audio_thread.is_alive()
         assert backend.get_state()["selectedSource"] == ""
+        assert backend.get_state()["scopeZeroLine"] is True
     finally:
         backend.stop()
     assert not backend.source_volume.active
     assert not backend._glib_thread.is_alive()
     assert not backend.audio_thread.is_alive()
+
+
+def test_scope_zero_line_persists_and_rejects_invalid_values(tmp_path, monkeypatch):
+    path = tmp_path / "settings.json"
+    monkeypatch.setattr(MODULE, "APP_SETTINGS_PATH", str(path))
+    monkeypatch.setattr(MODULE, "LEGACY_APP_SETTINGS_PATH", str(tmp_path / "legacy.json"))
+    monkeypatch.setattr(MODULE, "ART_CACHE_DIR", str(tmp_path / "art"))
+    monkeypatch.setattr(MODULE.AmbiBeatBackend, "_refresh_system_volume", lambda self: True)
+    backend = MODULE.AmbiBeatBackend(SimpleNamespace(list_names=lambda: []))
+    assert backend.update_setting("scope-zero-line", False) == ""
+    assert backend.get_state()["scopeZeroLine"] is False
+    assert MODULE._load_app_settings()["scope_zero_line"] is False
+    with pytest.raises(ValueError):
+        backend.update_setting("scope-zero-line", "false")
+    def fail_write(_settings):
+        raise OSError("disk full")
+    monkeypatch.setattr(MODULE, "_write_app_settings", fail_write)
+    with pytest.raises(OSError, match="disk full"):
+        backend.update_setting("scope-zero-line", True)
+    assert backend.scope_zero_line is False
+    path.write_text(json.dumps({"scope_zero_line": "false"}), encoding="utf-8")
+    assert MODULE._load_app_settings() == {}
 
 
 def test_legacy_app_settings_are_migrated_to_ambibeat_directory():
@@ -278,11 +280,15 @@ def test_legacy_app_settings_are_migrated_to_ambibeat_directory():
         assert legacy_path.exists()
 
 
-def test_legacy_bluetooth_boost_migrates_to_per_source_settings(tmp_path):
+def test_legacy_bluetooth_source_and_settings_are_removed(tmp_path):
     settings_path = tmp_path / "settings.json"
-    settings_path.write_text(json.dumps({"bluetooth_gain": 2.4}), encoding="utf-8")
+    player = "mpris:org.mpris.MediaPlayer2.player"
+    settings_path.write_text(json.dumps({
+        "bluetooth_gain": 2.4, "bluetooth_enabled": True, "selected_source": "bluetooth",
+        "source_gains": {"bluetooth": 2.0, player: 1.5},
+    }), encoding="utf-8")
     with patch.object(MODULE, "APP_SETTINGS_PATH", str(settings_path)):
-        assert MODULE._load_app_settings()["source_gains"] == {"bluetooth": 2.4}
+        assert MODULE._load_app_settings() == {"selected_source": "", "source_gains": {player: 1.5}}
 
 
 @pytest.mark.parametrize("saved,expected", [
@@ -518,10 +524,7 @@ def test_invalid_saved_artwork_mode_is_ignored():
 def test_state_exposes_selected_and_resolved_rotation_direction():
     backend = MODULE.AmbiBeatBackend.__new__(MODULE.AmbiBeatBackend)
     backend.track_info = {"title": "Song", "artist": "Artist", "album": "Album"}
-    backend.bluetooth_track_info = {"status": "paused"}
-    backend.bluetooth_enabled = True
-    backend.bluetooth_available = True
-    backend.selected_source = "bluetooth"
+    backend.selected_source = "mpris:org.mpris.MediaPlayer2.player"
     backend.edge_swirl_direction = "random"
     backend._edge_direction_lock = threading.Lock()
     backend._edge_direction_track = None
@@ -534,7 +537,9 @@ def test_state_exposes_selected_and_resolved_rotation_direction():
     backend.sample_rate = 48000
     backend.source_volume = SimpleNamespace(gains={})
     backend.boost_warning = ""
+    backend.photosensitivity_warning_acknowledged = False
     backend.visualizer_mode = 1
+    backend.scope_zero_line = True
     backend.edge_swirl = True
     backend.lighting_mode = "disco"
     backend.lighting_color_mode = "rainbow"
@@ -561,14 +566,8 @@ def test_state_exposes_selected_and_resolved_rotation_direction():
     assert state["discoLightCount"] == 12
     assert state["discoLightSize"] == 150
     assert state["sources"] == [
-        {"id": "bluetooth", "label": "Bluetooth Receiver", "status": "paused"},
         {"id": "mpris:org.mpris.MediaPlayer2.player", "label": "Player", "status": "playing"},
     ]
-    backend.bluetooth_enabled = False
-    assert all(source["id"] != "bluetooth" for source in backend.get_state()["sources"])
-    backend.bluetooth_enabled = True
-    backend.bluetooth_available = False
-    assert all(source["id"] != "bluetooth" for source in backend.get_state()["sources"])
 
 
 def test_edge_swirl_slowdown_is_validated_and_saved():
@@ -706,8 +705,6 @@ def test_switching_mpris_sources_pauses_other_players_and_plays_selected():
     target_source = "mpris:org.mpris.MediaPlayer2.target"
     backend.selected_source = old_source
     backend._source_choice_made = True
-    backend.bluetooth_track_info = {"status": "paused"}
-    backend._bluetooth_art_url = ""
     backend._mpris_players = {
         source.removeprefix("mpris:"): {
             "id": source,
@@ -739,6 +736,8 @@ def test_switching_mpris_sources_pauses_other_players_and_plays_selected():
         (other_source, "Pause"),
         (target_source, "Play"),
     ]
+    assert backend.set_source("bluetooth") == (False, "")
+    assert backend.selected_source == target_source
 
 
 def test_find_matching_album_cover_skips_unrelated_first_result():
@@ -790,6 +789,29 @@ def test_find_matching_track_cover_allows_same_artist_and_title_on_another_album
     cover = MODULE._find_matching_track_cover(hits, "Sam Fender", "Wild Long Lie")
 
     assert cover == "matching-track-cover"
+
+
+def test_catalog_collaboration_matches_a_credited_artist_only_for_exact_title():
+    hits = [
+        {"title": "Another Song", "artist": {"name": "Artist One"},
+         "album": {"cover_big": "wrong-title"}},
+        {"title": "Song", "artist": {"name": "Artist Three"},
+         "album": {"cover_big": "wrong-artist"}},
+        {"title": "Song", "artist": {"name": "Artist One"},
+         "album": {"cover_big": "right-cover"}},
+    ]
+    assert MODULE._find_matching_track_cover(hits, "Artist One & Artist Two", "Song") == "right-cover"
+    assert MODULE._find_matching_track_cover(hits[:2], "Artist One & Artist Two", "Song") == ""
+    itunes = [{"trackName": "Song", "artistName": "Artist Two", "artworkUrl100": "cover"}]
+    assert MODULE._find_matching_itunes_cover(itunes, "Artist One & Artist Two", "Song", "") == "cover"
+    similar_title = [{"title": "Example Titles", "artist": {"name": "Artist One"},
+                      "album": {"cover_big": "wrong-title"}}]
+    assert MODULE._find_matching_track_cover(
+        similar_title, "Artist One & Artist Two", "Example Title"
+    ) == ""
+    hits.append({"title": "Song", "artist": {"name": "Artist One & Artist Two"},
+                 "album": {"cover_big": "full-credit"}})
+    assert MODULE._find_matching_track_cover(hits, "Artist One & Artist Two", "Song") == "full-credit"
 
 
 def test_featured_device_title_matches_backend_track_title():
@@ -919,7 +941,66 @@ def test_remote_album_art_returns_error_when_both_services_are_unavailable():
     assert "iTunes" in error
 
 
-def test_bluetooth_http_device_art_is_primary_and_matching_mpris_art_is_not_used():
+def test_remote_art_retries_individual_credits_when_full_search_has_no_match():
+    requests = []
+    def open_url(request, timeout):
+        url = request.full_url
+        requests.append(url)
+        if "api.deezer.com" in url:
+            query = MODULE.urllib.parse.parse_qs(MODULE.urllib.parse.urlparse(url).query)["q"][0]
+            hits = []
+            if query == "Artist One Song":
+                hits = [{"title": "Song", "artist": {"name": "Artist One"},
+                         "album": {"cover_big": "https://example.com/cover.jpg"}}]
+            return _FakeResponse(json.dumps({"data": hits}).encode())
+        if "itunes.apple.com/search" in url:
+            return _FakeResponse(b'{"results": []}')
+        if url == "https://example.com/cover.jpg":
+            return _FakeResponse(b"cover")
+        raise AssertionError(f"Unexpected URL: {url}")
+
+    with patch.object(MODULE.urllib.request, "urlopen", side_effect=open_url):
+        image, service = MODULE._download_remote_album_art("Artist One & Artist Two", "Song", "")
+    assert (image, service) == (b"cover", "Deezer")
+    assert len(requests) == 5
+
+
+def test_catalog_search_cleans_video_title_before_query_and_matching():
+    queries = []
+    def open_url(request, timeout):
+        url = request.full_url
+        if "api.deezer.com" in url:
+            query = MODULE.urllib.parse.parse_qs(MODULE.urllib.parse.urlparse(url).query)["q"][0]
+            queries.append(query)
+            payload = {"data": [{
+                "title": "The Song", "artist": {"name": "Artist One"},
+                "album": {"cover_big": "https://example.com/cover.jpg"},
+            }]}
+            return _FakeResponse(json.dumps(payload).encode())
+        if "itunes.apple.com/search" in url:
+            query = MODULE.urllib.parse.parse_qs(MODULE.urllib.parse.urlparse(url).query)["term"][0]
+            queries.append(query)
+            return _FakeResponse(b'{"results": []}')
+        if url == "https://example.com/cover.jpg":
+            return _FakeResponse(b"cover")
+        raise AssertionError(f"Unexpected URL: {url}")
+
+    with patch.object(MODULE.urllib.request, "urlopen", side_effect=open_url):
+        image, service = MODULE._download_remote_album_art(
+            "Artist One & Artist Two",
+            "Artist One & Artist Two - The Song (Official Audio) (feat. Guest)", "",
+        )
+    assert (image, service) == (b"cover", "Deezer")
+    assert queries == ["Artist One & Artist Two The Song"] * 2
+
+
+def test_catalog_title_cleanup_preserves_distinct_titles_and_versions():
+    assert MODULE._catalog_track_title("Artist", "Other Artist - Song (Live)") == "Other Artist - Song (Live)"
+    assert MODULE._catalog_track_title("Artist", "Artist - Song (Live)") == "Song (Live)"
+    assert MODULE._catalog_track_title("Artist", "Artist - Song [Official Video]") == "Song"
+
+
+def test_http_player_art_is_primary_and_matching_mpris_art_is_not_used():
     backend = MODULE.AmbiBeatBackend.__new__(MODULE.AmbiBeatBackend)
     backend.track_info = {"art": ""}
     backend._mpris_players = {
@@ -940,7 +1021,7 @@ def test_bluetooth_http_device_art_is_primary_and_matching_mpris_art_is_not_used
             "album": "Album",
             "status": "playing",
         },
-        "bluetooth",
+        "mpris:org.mpris.MediaPlayer2.player",
         "https://example.com/device-art.jpg",
     )
 
@@ -949,61 +1030,16 @@ def test_bluetooth_http_device_art_is_primary_and_matching_mpris_art_is_not_used
     assert fetched[0][5] == ""
 
 
-def test_local_device_art_is_used_before_remote_services():
+def test_local_player_art_is_used_before_remote_services():
     backend = MODULE.AmbiBeatBackend.__new__(MODULE.AmbiBeatBackend)
     backend.track_info = {"art": ""}
     backend._last_art_key = ""
 
     with tempfile.NamedTemporaryFile(suffix=".jpg") as device_art:
         art_url = f"file://{device_art.name}"
-        backend._fetch_album_art("Artist", "Title", "Album", art_url, "bluetooth")
+        backend._fetch_album_art("Artist", "Title", "Album", art_url, "mpris:org.mpris.MediaPlayer2.player")
 
     assert backend.track_info["art"] == art_url
-
-
-def test_bluetooth_track_update_without_art_url_starts_remote_lookup():
-    backend = MODULE.AmbiBeatBackend.__new__(MODULE.AmbiBeatBackend)
-    backend.bluetooth_track_info = {
-        "title": "Waiting for Bluetooth...",
-        "artist": "",
-        "album": "",
-        "status": "stopped",
-        "device": "",
-        "art": "",
-    }
-    backend.track_info = backend.bluetooth_track_info.copy()
-    backend._bluetooth_art_url = "stale-url"
-    backend.selected_source = "bluetooth"
-    backend._mpris_players = {}
-    published = []
-    backend._publish_track = lambda track, source, art_url: published.append(
-        (track.copy(), source, art_url)
-    )
-
-    backend._update_from_player(
-        "",
-        {
-            "Track": {
-                "Title": "Current Bluetooth Song",
-                "Artist": "Bluetooth Artist",
-                "Album": "Bluetooth Album",
-            },
-            "Status": "playing",
-        },
-    )
-
-    assert published == [(
-        {
-            "title": "Current Bluetooth Song",
-            "artist": "Bluetooth Artist",
-            "album": "Bluetooth Album",
-            "status": "playing",
-            "device": "",
-            "art": "",
-        },
-        "bluetooth",
-        "",
-    )]
 
 
 def test_normalize_device_art_url_accepts_absolute_path():
@@ -1205,9 +1241,8 @@ def test_qt_frontend_excludes_removed_modes():
 
     assert "ambibeat-qt" in pyproject
     assert "ambibeat-qt.desktop" in install_source
-    assert '("WMP Bars", "WMP Scope", "Time Vortex", "No visualisation")' not in qt_source
-    assert "(0, \"WMP Bars\")" in qt_source
-    assert "(1, \"WMP Scope\")" in qt_source
+    assert "(0, \"Bars\")" in qt_source
+    assert "(1, \"Scope\")" in qt_source
     assert "(4, \"Time Vortex\")" in qt_source
     assert "(5, \"No visualisation\")" in qt_source
     assert "Christmas" not in qt_source

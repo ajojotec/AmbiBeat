@@ -19,7 +19,7 @@ On a vanilla Debian 13 installation, install the system dependencies manually:
 sudo ./scripts/install-dependencies-debian13.sh
 ```
 
-This installs Python's venv support, the system NumPy/D-Bus/GI bindings, and PulseAudio-compatible audio tools. Bluetooth receiver configuration is managed separately.
+This installs Python's venv support, the system NumPy/D-Bus/GI bindings, and PulseAudio-compatible audio tools.
 
 ```bash
 python3 -m venv --system-site-packages .venv
@@ -42,39 +42,43 @@ Launch the standalone Qt visualiser:
 ./.venv/bin/ambibeat-qt
 ```
 
-The Qt visualiser includes WMP Bars, WMP Scope, WMP Halo, Time Vortex, and No visualisation. Move the pointer or press a key to reveal the controls, and double-click the visualiser or press **F** to toggle fullscreen.
+Before the visualiser opens, a photosensitivity warning follows the system theme and accessibility settings. Select **Remember my acknowledgement** to save it in that user's settings; otherwise the warning appears again on the next launch. **Show photosensitivity warning on startup** in Settings lets you change this later.
+
+The Qt visualiser includes Bars, Scope, Halo, Time Vortex, and No visualisation. Move the pointer or press a key to reveal the controls. Click the left or right third of the visualiser to open visual effects or settings, respectively; double-click the middle third to cycle visualisations. The visual-effects menu can hide the Scope zero reference line; it is shown by default.
 
 The lower Qt controls, including the source menu and fullscreen button, appear above the track title and artist. When Qt starts, it selects a currently playing computer app if one is available, even if another source was saved; otherwise it keeps the current source.
 
-In Qt, artwork is centred on the screen in every visualisation mode. In WMP Halo, selected artwork fades outward in a circle in response to bass, surrounded by a glowing scope-style outline. The artwork opacity setting still applies; with no artwork, the halo retains its coloured glow.
+Showing or hiding the controls does not resize or move the visual effects; the controls appear over them.
+
+In Qt, artwork is centred on the screen in every visualisation mode. In Halo, selected artwork fades outward in a circle in response to bass, surrounded by a glowing scope-style outline. The artwork opacity setting still applies; with no artwork, the halo retains its coloured glow.
 
 Qt control borders use a bright colour derived from the selected artwork palette, reverting to their default appearance when no artwork colours are active.
 
-In Qt, the visual-effects button opens a left-side menu; click outside it to close it. Changes apply immediately, and **Reset to defaults** restores the visual settings. The settings menu contains source selection, system volume, per-source boost, sample rate, and the optional Bluetooth source. Select **Save** to apply changes, or close the menu (including by clicking outside) to choose whether to save or discard unsaved changes. Sliders ignore mouse-wheel input.
+In Qt, the visual-effects button opens a left-side menu; click outside it to close it. Changes apply immediately, and **Reset to defaults** restores the visual settings. The settings menu contains source selection, system volume, per-source boost, and sample rate. Select **Save** to apply changes, or close the menu (including by clicking outside) to choose whether to save or discard unsaved changes. Sliders ignore mouse-wheel input.
 
 The visual-effects menu offers **Show Album Art**, **Show Logo**, and **No artwork**. The choice is saved. Visualisation colours come from the selected album art or logo; **No artwork** uses the default colours and a background that fades from blue in the centre to black at the edges.
 
-The **Lighting** setting selects edge lighting, disco lights, or none, independently of the visualisation. Disco replaces the border with evenly spaced semicircular lights and ambient glows across the top and sides, using the current edge palette. With swirl off, the lights remain steady; with it on, they react to audio and different colours fade at different rates. **Disco light count** sets the total number of lights (3–40), and **Disco light size** sets their radius (40–200%). **Edge colour fade** controls their softness and decay, while the edge opacity and vividness controls also apply.
+The **Lighting** setting selects edge lighting, lights, or none, independently of the visualisation. Lights replaces the border with evenly spaced semicircular lights and ambient glows across the top and sides, using the current edge palette. With swirl off, the lights remain steady; with it on, they react to audio and different colours fade at different rates. **Light count** sets the total number of lights (3–40), and **Light size** sets their radius (40–200%). **Edge colour fade** controls their softness and decay, while the edge opacity and vividness controls also apply.
 
-**Lighting colours** selects artwork-derived colours or rainbow colours for the border and disco lights. Rainbow uses the default blue-to-black background and white Qt control borders; visualisation colours still follow the selected artwork.
+**Lighting colours** selects artwork-derived colours or rainbow colours for the border and lights. Rainbow uses the default blue-to-black background and white Qt control borders; visualisation colours still follow the selected artwork.
 
-**Border depth** controls how far edge lighting extends into the screen (25–200%); 100% is the standard depth. It does not change disco light size.
+**Border depth** controls how far edge lighting extends into the screen (25–200%); 100% is the standard depth. It does not change light size.
 
 Qt's edge lighting fades around a circular centre, including on widescreen displays.
 
 When hardware OpenGL is available, Qt uses it to render the visualiser and lighting. It automatically falls back to CPU rendering if OpenGL or the required shader is unavailable; the fallback reason is written to standard error.
 
 While playback is active, the app requests system idle/sleep inhibition so the display stays on. The inhibition ends when playback stops or the app shuts down.
-Use the fullscreen icon, double-click the visualiser, or press **F** to toggle fullscreen; press **Esc** to exit.
+Use the fullscreen icon or press **F11** to toggle fullscreen; press **Esc** to exit.
 Choose a visualisation from the visual-effects menu; the selected mode is saved automatically. With no visualisation, album art is shown prominently without the animated effects. Time Vortex is an original audio-reactive tunnel: its irregular rings ripple outward and fade into darkness, while the centre moves with bass beats and the spectrum's pitch balance.
 Up to three distinct colors from the album art blend into a soft glow along the screen edges for Ambilight sampling; the default blue/purple edge glow is used when artwork is unavailable. When edge swirl is enabled, this glow itself flows around the screen in time with detected bass beats instead of adding a separate border.
 Icon-only previous, play/pause, and next controls support the left/right arrows, Space, and media keys. Controls fade after 2.5 seconds of inactivity and reappear on pointer movement or keyboard input.
-The visual-effects menu provides edge-colour vividness and speed controls (tempo-matched to 20× slower), and a switch to swirl edge colours or make disco lights react to music.
+The visual-effects menu provides edge-colour vividness and speed controls (tempo-matched to 20× slower), and a switch to swirl edge colours or make lights react to music.
 When edge swirl is enabled, **Border rotation direction** selects clockwise, counter-clockwise, or a randomly chosen direction for each track.
-Use the playback-source menu or Settings to switch between MPRIS players in the current user session. An externally configured Bluetooth audio receiver appears only when enabled in Settings and available. Switching sources pauses other currently playing media players and starts the selected source.
+Use the playback-source menu or Settings to switch between MPRIS players in the current user session. Switching sources pauses other currently playing media players and starts the selected source.
 The **Selected source volume boost** slider (1x–4x) remembers a separate level per source. It changes only identifiable audio streams belonging to that source, and restores their unboosted volume when switching sources or closing the app. If the app exits unexpectedly, it uses its recovery record to restore the volume on its next launch. Some media players use a separate process for audio; if their stream cannot be identified, the boost is not applied and a warning is shown in Settings. High settings may distort, so raise the level gradually. System volume is available in Settings and from the speaker control in the bottom media controls.
-Settings are saved separately for each user in `${XDG_CONFIG_HOME:-~/.config}/ambibeat/settings.json`. The app remembers per-source boosts, Bluetooth source visibility, the selected source, sample rate, visualiser mode, artwork and lighting choices, edge-swirl setting and direction, edge-colour speed, and edge-colour vividness. Existing settings in the user's former `bt-audio-companion` directory are imported automatically. System volume is read from and managed by the audio server.
-Artwork lookup uses the selected player's art URL, then the exact catalog album, matching artwork exposed by the Bluetooth device or its associated Plasma player, and finally a same-artist/title catalog cover if the album entry differs.
+Settings are saved separately for each user in `${XDG_CONFIG_HOME:-~/.config}/ambibeat/settings.json`. The app remembers per-source boosts, the selected source, sample rate, visualiser mode and Scope zero line, artwork and lighting choices, edge-swirl setting and direction, edge-colour speed, and edge-colour vividness. Existing settings in the user's former `bt-audio-companion` directory are imported automatically. System volume is read from and managed by the audio server.
+Artwork lookup uses the selected player's art URL, matching local artwork from other players, and catalog artwork. Catalog searches remove matching artist prefixes and official-audio/video markers from track titles. If a search for a collaboration finds no match, AmbiBeat also searches for its individual credited artists.
 
 ## Privacy and local data
 

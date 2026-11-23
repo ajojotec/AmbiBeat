@@ -62,13 +62,6 @@ class SourceVolume:
         return (list(left) == list(right)
                 and all(abs(left[channel] - right[channel]) <= 1 for channel in left))
 
-    def _matches(self, stream, source, pids):
-        props = stream.get("properties") or {}
-        if source == "bluetooth":
-            return (props.get("device.api") == "bluez5"
-                    and props.get("api.bluez5.profile") == "a2dp-source")
-        return str(props.get("application.process.id", "")) in pids
-
     def _restore_locked(self, cookie, streams):
         streams_by_index = {str(stream.get("index")): stream for stream in streams}
         for key, entry in list(self.journal.items()):
@@ -111,8 +104,9 @@ class SourceVolume:
             if not self.active or not source or gain == 1.0:
                 self._restore_locked(cookie, streams)
                 return
-            pids = self.player_pids(source) if source != "bluetooth" else set()
-            matches = [stream for stream in streams if self._matches(stream, source, pids)]
+            pids = self.player_pids(source)
+            matches = [stream for stream in streams
+                       if str((stream.get("properties") or {}).get("application.process.id", "")) in pids]
             current_indices = {str(stream["index"]) for stream in matches}
             if any(key not in current_indices or entry["source"] != source
                    for key, entry in self.journal.items()):

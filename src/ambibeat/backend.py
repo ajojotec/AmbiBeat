@@ -104,6 +104,12 @@ def _load_app_settings():
         return {}
 
     settings = {}
+    warning_acknowledged = data.get("photosensitivity_warning_acknowledged")
+    if isinstance(warning_acknowledged, bool):
+        settings["photosensitivity_warning_acknowledged"] = warning_acknowledged
+    elif "photosensitivity_warning_acknowledged" in data:
+        print("Ignoring invalid photosensitivity warning acknowledgement", flush=True)
+
     sample_rate = data.get("sample_rate")
     if sample_rate in SAMPLE_RATES and isinstance(sample_rate, int):
         settings["sample_rate"] = sample_rate
@@ -114,6 +120,8 @@ def _load_app_settings():
     gains = {}
     if isinstance(raw_gains, dict):
         for source_id, raw_gain in raw_gains.items():
+            if source_id == "bluetooth":
+                continue
             if (isinstance(source_id, str) and source_id
                     and isinstance(raw_gain, (int, float)) and not isinstance(raw_gain, bool)
                     and math.isfinite(raw_gain) and 1.0 <= raw_gain <= 4.0):
@@ -122,18 +130,8 @@ def _load_app_settings():
                 print("Ignoring invalid saved source boost", flush=True)
     else:
         print("Ignoring invalid saved source boosts", flush=True)
-    legacy_gain = data.get("bluetooth_gain")
-    if (isinstance(legacy_gain, (int, float)) and not isinstance(legacy_gain, bool)
-            and math.isfinite(legacy_gain) and 1.0 <= legacy_gain <= 4.0):
-        gains.setdefault("bluetooth", float(legacy_gain))
     if gains or "source_gains" in data:
         settings["source_gains"] = gains
-    bluetooth_enabled = data.get("bluetooth_enabled", False)
-    if isinstance(bluetooth_enabled, bool):
-        if "bluetooth_enabled" in data:
-            settings["bluetooth_enabled"] = bluetooth_enabled
-    else:
-        print("Ignoring invalid Bluetooth source setting", flush=True)
 
     journal = data.get("volume_journal", {})
     if isinstance(journal, dict):
@@ -171,8 +169,10 @@ def _load_app_settings():
         print("Ignoring invalid saved volume recovery journal", flush=True)
 
     source = data.get("selected_source")
-    if (
-        source in ("", "bluetooth")
+    if source == "bluetooth":
+        settings["selected_source"] = ""
+    elif (
+        source == ""
         or (
             isinstance(source, str)
             and source.startswith(f"mpris:{MPRIS_PREFIX}")
@@ -199,6 +199,12 @@ def _load_app_settings():
             settings["visualizer_mode"] = visualizer_mode
     elif "visualizer_mode" in data:
         print("Ignoring invalid saved visualizer mode", flush=True)
+
+    scope_zero_line = data.get("scope_zero_line")
+    if isinstance(scope_zero_line, bool):
+        settings["scope_zero_line"] = scope_zero_line
+    elif "scope_zero_line" in data:
+        print("Ignoring invalid saved scope zero line setting", flush=True)
 
     edge_swirl = data.get("edge_swirl")
     if isinstance(edge_swirl, bool):
@@ -388,6 +394,43 @@ def _artist_match_score(expected, candidate):
     return _metadata_match_score(expected, candidate)
 
 
+def _artist_credits(artist):
+    return [part.strip() for part in re.split(
+        r"\s+(?:&|and|feat\.?|ft\.?|featuring|with)\s+|,\s*",
+        str(artist), flags=re.IGNORECASE,
+    ) if part.strip()]
+
+
+def _catalog_artist_match_score(expected, candidate, title_score):
+    score = _artist_match_score(expected, candidate)
+    if score >= 0.9 or title_score != 1.0:
+        return score
+    credits = _artist_credits(expected)
+    normalized_candidate = _normalize_metadata(candidate)
+    if normalized_candidate and len(credits) > 1 and normalized_candidate in {
+        _normalize_metadata(credit) for credit in credits
+    }:
+        return 0.9
+    return score
+
+
+def _catalog_track_title(artist, title):
+    title = str(title).strip()
+    parts = re.split(r"\s+[-–—]\s+", title, maxsplit=1)
+    if len(parts) == 2 and _artist_match_score(artist, parts[0]) >= 0.9:
+        title = parts[1]
+    title = re.sub(
+        r"\s*[\(\[]\s*(?:official\s+(?:audio|video|music video)|"
+        r"(?:official\s+)?lyric(?:s| video|s video)?)\s*[\)\]]",
+        "", title, flags=re.IGNORECASE,
+    )
+    title = re.sub(
+        r"\s*[\(\[]\s*(?:feat(?:uring)?|ft)\.?\s+[^\)\]]*[\)\]]",
+        "", title, flags=re.IGNORECASE,
+    )
+    return title.strip()
+
+
 def _track_art_key(artist, title, album, art_url, source_id="", fallback_art_url=""):
     return f"{source_id}|{artist}|{title}|{album}|{art_url}|{fallback_art_url}"
 
@@ -495,7 +538,7 @@ def _find_matching_album_cover(hits, artist, title, album):
         if not isinstance(album_data, dict) or not isinstance(artist_data, dict):
             continue
         title_score = _track_match_score(title, hit.get("title", ""))
-        artist_score = _artist_match_score(artist, artist_data.get("name", ""))
+        artist_score = _catalog_artist_match_score(artist, artist_data.get("name", ""), title_score)
         album_score = _metadata_match_score(album, album_data.get("title", "")) if album else 1.0
         if title_score < 0.9 or artist_score < 0.9 or album_score < 0.88:
             continue
@@ -537,7 +580,7 @@ def _find_matching_itunes_cover(hits, artist, title, album):
         hit_artist = hit.get("artistName") or ""
         hit_album = hit.get("collectionName") or ""
         title_score = _track_match_score(title, hit_title)
-        artist_score = _artist_match_score(artist, hit_artist)
+        artist_score = _catalog_artist_match_score(artist, hit_artist, title_score)
         album_score = _metadata_match_score(album, hit_album) if album else 1.0
         if title_score < 0.9 or artist_score < 0.9 or album_score < 0.88:
             continue
@@ -553,63 +596,59 @@ def _find_matching_itunes_cover(hits, artist, title, album):
 
 
 def _download_remote_album_art(artist, title, album):
-    query_artist = artist.replace('"', "")
+    title = _catalog_track_title(artist, title) or title
     query_title = title.replace('"', "")
     cover_urls = []
     failures = []
+    credits = _artist_credits(artist)
+    queries = [artist]
+    if len(credits) > 1:
+        queries.extend(credit for credit in credits if credit != artist)
 
-    try:
-        query = urllib.parse.urlencode({
-            "q": f"{query_artist} {query_title}",
-            "limit": 25,
-        })
-        url = "https://api.deezer.com/search?" + query
-        req = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AmbiBeat/1.0",
-                "Accept": "application/json",
-            },
-        )
-        with urllib.request.urlopen(req, timeout=6) as resp:
-            data = json.loads(resp.read().decode("utf-8", errors="ignore"))
-        hits = data.get("data", [])
-        art_url = _find_matching_album_cover(hits, artist, title, album)
-        if not art_url:
-            art_url = _find_matching_track_cover(hits, artist, title)
-        if art_url:
-            cover_urls.append(("Deezer", art_url))
-        else:
-            failures.append("Deezer: no matching artwork")
-    except Exception as error:
-        failures.append(f"Deezer: {error}")
+    unavailable = set()
+    for query_artist in queries:
+        for service in ("Deezer", "iTunes"):
+            if service in unavailable:
+                continue
+            try:
+                if service == "Deezer":
+                    safe_artist = query_artist.replace('"', "")
+                    query = urllib.parse.urlencode({
+                        "q": f"{safe_artist} {query_title}", "limit": 25,
+                    })
+                    url = "https://api.deezer.com/search?" + query
+                    user_agent = "Mozilla/5.0 (X11; Linux x86_64) AmbiBeat/1.0"
+                else:
+                    query = urllib.parse.urlencode({
+                        "term": f"{query_artist} {title}", "media": "music", "limit": 25,
+                    })
+                    url = "https://itunes.apple.com/search?" + query
+                    user_agent = "AmbiBeat/1.0"
+                req = urllib.request.Request(
+                    url, headers={"User-Agent": user_agent, "Accept": "application/json"},
+                )
+                with urllib.request.urlopen(req, timeout=6) as resp:
+                    data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+                if not isinstance(data, dict):
+                    raise ValueError("Invalid catalog response")
+                if service == "Deezer":
+                    hits = data.get("data", [])
+                    art_url = (_find_matching_album_cover(hits, artist, title, album)
+                               or _find_matching_track_cover(hits, artist, title))
+                else:
+                    hits = data.get("results", [])
+                    art_url = (_find_matching_itunes_cover(hits, artist, title, album)
+                               or _find_matching_itunes_cover(hits, artist, title, ""))
+                if art_url:
+                    cover_urls.append((service, art_url))
+                else:
+                    failures.append(f"{service}: no matching artwork")
+            except (OSError, ValueError, TypeError) as error:
+                unavailable.add(service)
+                failures.append(f"{service}: {error}")
 
-    try:
-        params = urllib.parse.urlencode({
-            "term": f"{artist} {title}",
-            "media": "music",
-            "limit": 25,
-        })
-        url = "https://itunes.apple.com/search?" + params
-        req = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": "AmbiBeat/1.0",
-                "Accept": "application/json",
-            },
-        )
-        with urllib.request.urlopen(req, timeout=6) as resp:
-            data = json.loads(resp.read().decode("utf-8", errors="ignore"))
-        hits = data.get("results", [])
-        art_url = _find_matching_itunes_cover(hits, artist, title, album)
-        if not art_url:
-            art_url = _find_matching_itunes_cover(hits, artist, title, "")
-        if art_url:
-            cover_urls.append(("iTunes", art_url))
-        else:
-            failures.append("iTunes: no matching artwork")
-    except Exception as error:
-        failures.append(f"iTunes: {error}")
+        if cover_urls or len(unavailable) == 2:
+            break
 
     for service_name, art_url in cover_urls:
         try:
@@ -633,13 +672,12 @@ def _download_remote_album_art(artist, title, album):
 class AmbiBeatBackend:
     """Own playback state, audio capture, event-loop resources, and settings."""
 
-    def __init__(self, session_bus, system_bus):
+    def __init__(self, session_bus):
         self.session_bus = session_bus
-        self.system_bus = system_bus
         os.makedirs(ART_CACHE_DIR, exist_ok=True)
 
-        self.bluetooth_track_info = {
-            "title": "Waiting for Bluetooth...",
+        self.track_info = {
+            "title": "Waiting for music...",
             "artist": "",
             "album": "",
             "status": "stopped",
@@ -647,8 +685,6 @@ class AmbiBeatBackend:
             "art": "",
             "artStatus": "loading",
         }
-        self.track_info = {**self.bluetooth_track_info, "title": "Waiting for music..."}
-        self._bluetooth_art_url = ""
         self._mpris_players = {}
         self._mpris_errors = set()
         self._last_art_key = ""
@@ -656,9 +692,10 @@ class AmbiBeatBackend:
         self.wave = [0.0] * 64
         self.sample_rate = 48000
         settings = _load_app_settings()
+        self.photosensitivity_warning_acknowledged = settings.get(
+            "photosensitivity_warning_acknowledged", False
+        )
         self.sample_rate = settings.get("sample_rate", self.sample_rate)
-        self.bluetooth_enabled = settings.get("bluetooth_enabled", False)
-        self.bluetooth_available = False
         self.source_volume = SourceVolume(
             settings.get("source_gains", {}), settings.get("volume_journal", {}),
             self._save_settings, self._source_process_ids,
@@ -667,6 +704,7 @@ class AmbiBeatBackend:
         self.system_volume = None
         self._last_system_volume_error = ""
         self.visualizer_mode = settings.get("visualizer_mode", 0)
+        self.scope_zero_line = settings.get("scope_zero_line", True)
         self.edge_swirl = settings.get("edge_swirl", False)
         self.lighting_mode = settings.get("lighting_mode", "border")
         self.lighting_color_mode = settings.get("lighting_color_mode", "artwork")
@@ -693,13 +731,6 @@ class AmbiBeatBackend:
         self._capture_proc = None
         self._idle_inhibitor = None
 
-        if self.system_bus is not None:
-            self.system_bus.add_signal_receiver(
-                self._on_properties_changed,
-                dbus_interface="org.freedesktop.DBus.Properties",
-                signal_name="PropertiesChanged",
-                path_keyword="path",
-            )
         try:
             self.source_volume.restore()
         except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as error:
@@ -794,12 +825,29 @@ class AmbiBeatBackend:
             raise
         return True
 
+    def acknowledge_photosensitivity_warning(self):
+        self.set_show_photosensitivity_warning(False)
+
+    def set_show_photosensitivity_warning(self, show):
+        if not isinstance(show, bool):
+            return False
+        with self.source_volume.lock:
+            previous = self.photosensitivity_warning_acknowledged
+            self.photosensitivity_warning_acknowledged = not show
+            try:
+                self._save_settings()
+            except OSError:
+                self.photosensitivity_warning_acknowledged = previous
+                raise
+        return True
+
     def update_setting(self, name, value, source_id=None):
         setters = {
             "sample-rate": self.set_sample_rate,
-            "bluetooth-enabled": self.set_bluetooth_enabled,
+            "show-photosensitivity-warning": self.set_show_photosensitivity_warning,
             "system-volume": self.set_system_volume,
             "visualizer-mode": self.set_visualizer_mode,
+            "scope-zero-line": self.set_scope_zero_line,
             "artwork-mode": self.set_artwork_mode,
             "album-art-opacity": self.set_album_art_opacity,
             "lighting-mode": self.set_lighting_mode,
@@ -939,7 +987,7 @@ class AmbiBeatBackend:
 
     def set_source_gain(self, source_id, gain):
         if (not source_id or isinstance(gain, bool) or not math.isfinite(gain) or not 1.0 <= gain <= 4.0
-                or (source_id != "bluetooth" and not source_id.startswith(f"mpris:{MPRIS_PREFIX}"))):
+                or not source_id.startswith(f"mpris:{MPRIS_PREFIX}")):
             return False
         with self.source_volume.lock:
             previous = self.source_volume.gains.get(source_id)
@@ -967,18 +1015,6 @@ class AmbiBeatBackend:
                 raise
         return True
 
-    def set_bluetooth_enabled(self, enabled):
-        previous = self.bluetooth_enabled
-        self.bluetooth_enabled = enabled
-        try:
-            self._save_settings()
-            self._refresh_bluetooth_availability()
-            self._refresh_mpris_players()
-        except (OSError, subprocess.SubprocessError, ValueError, RuntimeError):
-            self.bluetooth_enabled = previous
-            raise
-        return True
-
     def set_visualizer_mode(self, mode):
         if not isinstance(mode, int) or isinstance(mode, bool) or mode not in (0, 1, 2, 4, 5):
             return False
@@ -988,6 +1024,18 @@ class AmbiBeatBackend:
             self._save_settings()
         except OSError:
             self.visualizer_mode = previous_mode
+            raise
+        return True
+
+    def set_scope_zero_line(self, enabled):
+        if not isinstance(enabled, bool):
+            return False
+        previous = self.scope_zero_line
+        self.scope_zero_line = enabled
+        try:
+            self._save_settings()
+        except OSError:
+            self.scope_zero_line = previous
             raise
         return True
 
@@ -1097,11 +1145,12 @@ class AmbiBeatBackend:
         with self.source_volume.lock:
             _write_app_settings({
                 "sample_rate": self.sample_rate,
+                "photosensitivity_warning_acknowledged": self.photosensitivity_warning_acknowledged,
                 "source_gains": self.source_volume.gains,
                 "volume_journal": self.source_volume.journal,
-                "bluetooth_enabled": self.bluetooth_enabled,
                 "selected_source": self.selected_source,
                 "visualizer_mode": self.visualizer_mode,
+                "scope_zero_line": self.scope_zero_line,
                 "edge_swirl": self.edge_swirl,
                 "lighting_mode": self.lighting_mode,
                 "lighting_color_mode": self.lighting_color_mode,
@@ -1204,55 +1253,7 @@ class AmbiBeatBackend:
             self.boost_warning = ""
         return True
 
-    def _refresh_bluetooth_availability(self):
-        self.bluetooth_available = False
-        if not self.bluetooth_enabled:
-            return
-        player_found = False
-        try:
-            if self.system_bus is not None:
-                manager = dbus.Interface(
-                    self.system_bus.get_object("org.bluez", "/"),
-                    "org.freedesktop.DBus.ObjectManager",
-                )
-                objects = manager.GetManagedObjects()
-                connected = {str(path) for path, interfaces in objects.items()
-                             if interfaces.get("org.bluez.Device1", {}).get("Connected")}
-                for path, interfaces in objects.items():
-                    if ("org.bluez.MediaPlayer1" in interfaces
-                            and any(str(path).startswith(device + "/") for device in connected)):
-                        player_found = self.bluetooth_available = True
-                        self._update_from_player(path, interfaces["org.bluez.MediaPlayer1"])
-        except dbus.DBusException as error:
-            print(f"Bluetooth source could not be discovered: {error}", flush=True)
-        try:
-            streams = json.loads(subprocess.run(
-                ["pactl", "-f", "json", "list", "sink-inputs"],
-                check=True, capture_output=True, text=True,
-            ).stdout)
-            bluetooth_streams = [stream for stream in streams
-                                 if self.source_volume._matches(stream, "bluetooth", set())]
-            if bluetooth_streams:
-                self.bluetooth_available = True
-                if not player_found:
-                    self.bluetooth_track_info.update({
-                        "title": "Bluetooth audio",
-                        "artist": "", "album": "", "art": "", "artStatus": "fallback",
-                        "status": "playing" if any(not stream.get("corked", False)
-                                                   for stream in bluetooth_streams) else "paused",
-                    })
-                    self._bluetooth_art_url = ""
-                    if self.selected_source == "bluetooth":
-                        self._publish_track(self.bluetooth_track_info, "bluetooth", "")
-        except (OSError, subprocess.SubprocessError, ValueError) as error:
-            print(f"Bluetooth audio streams could not be discovered: {error}", flush=True)
-
-    def _on_properties_changed(self, interface, changed, invalidated, path=None):
-        if self.bluetooth_enabled and interface == "org.bluez.MediaPlayer1":
-            self._update_from_player(path, changed)
-
     def _refresh_mpris_players(self):
-        self._refresh_bluetooth_availability()
         players = {}
         for bus_name in self.session_bus.list_names():
             bus_name = str(bus_name)
@@ -1298,21 +1299,16 @@ class AmbiBeatBackend:
             player = players.get(bus_name)
             if player:
                 self._publish_track(player["track"], player["id"], player["art_url"])
-        selected_available = (
-            self.selected_source == "bluetooth" and self.bluetooth_available
-            or self.selected_source.startswith("mpris:")
-            and self.selected_source[len("mpris:"):] in players
-        )
+        selected_available = (self.selected_source.startswith("mpris:")
+                              and self.selected_source[len("mpris:"):] in players)
         if not selected_available:
             active_player = next(
                 (player for player in players.values()
                  if player["track"]["status"] == "playing"),
                 None,
             )
-            target = active_player["id"] if active_player else (
-                "bluetooth" if self.bluetooth_available else next(
-                    (player["id"] for player in players.values()), ""
-                )
+            target = active_player["id"] if active_player else next(
+                (player["id"] for player in players.values()), ""
             )
             with self.source_volume.lock:
                 try:
@@ -1322,9 +1318,7 @@ class AmbiBeatBackend:
                     print(self.boost_warning, flush=True)
                     return True
                 self.selected_source = target
-                if target == "bluetooth":
-                    self._publish_track(self.bluetooth_track_info, target, self._bluetooth_art_url)
-                elif target:
+                if target:
                     player = players[target[len("mpris:"):]]
                     self._publish_track(player["track"], target, player["art_url"])
                 else:
@@ -1341,16 +1335,12 @@ class AmbiBeatBackend:
 
     def _set_source(self, source_id):
         previous_source = self.selected_source
-        if source_id == "bluetooth" and not self.bluetooth_available:
+        if not isinstance(source_id, str) or not source_id.startswith("mpris:"):
             return False, ""
-        if source_id != "bluetooth" and not source_id.startswith("mpris:"):
+        bus_name = source_id[len("mpris:"):]
+        player = self._mpris_players.get(bus_name)
+        if not player:
             return False, ""
-        player = None
-        if source_id != "bluetooth":
-            bus_name = source_id[len("mpris:"):]
-            player = self._mpris_players.get(bus_name)
-            if not player:
-                return False, ""
 
         warnings = []
         switching = previous_source != source_id
@@ -1361,13 +1351,6 @@ class AmbiBeatBackend:
                 warning = f"Source volume could not be restored: {error}"
                 print(warning, flush=True)
                 return False, warning
-            if (
-                previous_source == "bluetooth"
-                and self.bluetooth_track_info.get("status") == "playing"
-            ):
-                warning = self._bluetooth_control_warning("Pause")
-                if warning:
-                    warnings.append(warning)
             for other_player in self._mpris_players.values():
                 if (
                     other_player["id"] != source_id
@@ -1377,20 +1360,11 @@ class AmbiBeatBackend:
                     if warning:
                         warnings.append(warning)
         self.selected_source = source_id
-        if source_id == "bluetooth":
-            self._publish_track(
-                self.bluetooth_track_info, "bluetooth", self._bluetooth_art_url
-            )
-            if switching:
-                warning = self._bluetooth_control_warning("Play")
-                if warning:
-                    warnings.append(warning)
-        else:
-            self._publish_track(player["track"], source_id, player["art_url"])
-            if switching:
-                warning = self._mpris_control_warning(source_id, "Play")
-                if warning:
-                    warnings.append(warning)
+        self._publish_track(player["track"], source_id, player["art_url"])
+        if switching:
+            warning = self._mpris_control_warning(source_id, "Play")
+            if warning:
+                warnings.append(warning)
         try:
             self.source_volume.apply(source_id)
         except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as error:
@@ -1405,16 +1379,6 @@ class AmbiBeatBackend:
             print(warning, flush=True)
             warnings.append(warning)
         return True, "; ".join(warnings)
-
-    def _bluetooth_control_warning(self, action):
-        try:
-            if self._control_bluetooth(action):
-                return ""
-            warning = "Bluetooth media player is unavailable; the source was changed."
-        except dbus.DBusException as error:
-            warning = f"Bluetooth playback could not be {action.lower()}ed: {error}"
-        print(warning, flush=True)
-        return warning
 
     def _mpris_control_warning(self, source_id, action):
         try:
@@ -1546,7 +1510,7 @@ class AmbiBeatBackend:
 
         if (
             not title
-            or title in ("Waiting for Bluetooth...", "Waiting for music...", "Unknown Title")
+            or title in ("Waiting for music...", "Unknown Title")
             or not artist
             or artist == "Unknown Artist"
         ):
@@ -1605,51 +1569,8 @@ class AmbiBeatBackend:
 
         threading.Thread(target=_download, daemon=True).start()
 
-    def _update_from_player(self, path, props):
-        if "Track" in props:
-            track = props["Track"]
-            title = str(track.get("Title", "Unknown Title"))
-            artist = str(track.get("Artist", "Unknown Artist"))
-            album = str(track.get("Album", ""))
-            self._bluetooth_art_url = _normalize_device_art_url(
-                track.get("ArtUrl", track.get("xesam:artUrl", ""))
-            )
-            self.bluetooth_track_info.update({
-                "title": title,
-                "artist": artist,
-                "album": album,
-            })
-
-        if "Status" in props:
-            self.bluetooth_track_info["status"] = str(props["Status"]).lower()
-
-        if path and "dev_" in path:
-            dev_path = path.split("/player")[0]
-            try:
-                dev_props = dbus.Interface(
-                    self.system_bus.get_object("org.bluez", dev_path),
-                    "org.freedesktop.DBus.Properties",
-                )
-                self.bluetooth_track_info["device"] = str(
-                    dev_props.Get("org.bluez.Device1", "Alias")
-                )
-            except Exception:
-                pass
-        if self.selected_source == "bluetooth":
-            self._publish_track(
-                self.bluetooth_track_info, "bluetooth", self._bluetooth_art_url
-            )
-
     def _get_default_monitor(self):
         try:
-            if self.selected_source == "bluetooth":
-                sources = subprocess.check_output(
-                    ["pactl", "list", "short", "sources"], text=True
-                )
-                for line in sources.splitlines():
-                    parts = line.split("\t")
-                    if len(parts) >= 2 and "bluez_input" in parts[1]:
-                        return parts[1]
             sinks = subprocess.check_output(
                 ["pactl", "list", "short", "sinks"], text=True
             )
@@ -1727,9 +1648,6 @@ class AmbiBeatBackend:
                         previous_bars=self.bars,
                         agc_peak=agc_peak,
                         hop_size=capture_samples,
-                        gain=(self.source_volume.gains.get("bluetooth", 1.0)
-                              if self.selected_source == "bluetooth"
-                              and self.source_volume.active else 1.0),
                     )
                     self.wave = wave
                     self.bars = bars
@@ -1751,29 +1669,25 @@ class AmbiBeatBackend:
         track = self.track_info.copy()
         selected_source = self.selected_source
         resolved_direction = self._resolved_edge_swirl_direction(track, selected_source)
-        sources = []
-        if self.bluetooth_enabled and self.bluetooth_available:
-            sources.append({"id": "bluetooth", "label": "Bluetooth Receiver",
-                            "status": self.bluetooth_track_info.get("status", "")})
-        sources.extend(
+        sources = [
             {"id": player["id"], "label": player["label"],
              "status": player["track"].get("status", "")}
             for player in sorted(
                 self._mpris_players.values(),
                 key=lambda item: item["label"].casefold(),
             )
-        )
+        ]
         return {
                 "track": track,
                 "bars": self.bars,
                 "wave": self.wave,
                 "sampleRate": self.sample_rate,
                 "sampleRates": SAMPLE_RATES,
+                "showPhotosensitivityWarning": not self.photosensitivity_warning_acknowledged,
                 "sourceGains": self.source_volume.gains.copy(),
-                "bluetoothEnabled": self.bluetooth_enabled,
-                "bluetoothAvailable": self.bluetooth_available,
                 "boostWarning": self.boost_warning,
                 "visualizerMode": self.visualizer_mode,
+                "scopeZeroLine": self.scope_zero_line,
                 "edgeSwirl": self.edge_swirl,
                 "lightingMode": self.lighting_mode,
                 "lightingColorMode": self.lighting_color_mode,
@@ -1799,10 +1713,6 @@ class AmbiBeatBackend:
             self._control_mpris_player(self.selected_source, action)
             return
 
-        if self.selected_source == "bluetooth" and self.bluetooth_available:
-            if self._control_bluetooth(action):
-                return
-            raise RuntimeError("Bluetooth playback controls are unavailable")
         raise RuntimeError("No playback source is selected")
 
     def _control_mpris_player(self, source_id, action):
@@ -1814,23 +1724,5 @@ class AmbiBeatBackend:
         )
         player = dbus.Interface(obj, MPRIS_PLAYER_INTERFACE)
         getattr(player, action)()
-
-    def _control_bluetooth(self, action):
-        if self.system_bus is None:
-            return False
-        mgr = dbus.Interface(
-            self.system_bus.get_object("org.bluez", "/"),
-            "org.freedesktop.DBus.ObjectManager",
-        )
-        for path, ifaces in mgr.GetManagedObjects().items():
-            if "org.bluez.MediaPlayer1" in ifaces:
-                player = dbus.Interface(
-                    self.system_bus.get_object("org.bluez", path),
-                    "org.bluez.MediaPlayer1",
-                )
-                if hasattr(player, action):
-                    getattr(player, action)()
-                    return True
-        return False
 
 

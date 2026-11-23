@@ -130,16 +130,26 @@ def test_failed_recovery_prevents_reapplying_boost(audio, monkeypatch):
     assert manager.journal
 
 
-def test_bluetooth_boost_only_targets_bluetooth_audio_stream(audio):
+def test_legacy_bluetooth_volume_journal_is_still_restored(audio):
     manager, streams, changes, _ = audio
     streams[0]["properties"] = {
-        "device.api": "bluez5", "api.bluez5.profile": "a2dp-source", "object.serial": "10",
+        "device.api": "bluez5", "api.bluez5.profile": "a2dp-source",
+        "api.bluez5.address": "00:11:22:33:44:55", "object.serial": "10",
     }
-    manager.gains["bluetooth"] = 1.5
-    manager.activate("bluetooth")
-    assert changes == [(10, {"front-left": 49152, "front-right": 49152})]
-    manager.deactivate()
-    assert streams[0]["volume"]["front-left"]["value"] == 32768
+    for channel in streams[0]["volume"].values():
+        channel["value"] = 49152
+    manager.journal["10"] = {
+        "cookie": "server-cookie", "fingerprint": {
+            "object.serial": "10", "application.process.id": "", "application.name": "",
+            "node.name": "", "api.bluez5.address": "00:11:22:33:44:55",
+            "api.bluez5.profile": "a2dp-source",
+        },
+        "source": "bluetooth", "base": {"front-left": 32768, "front-right": 32768},
+        "target": {"front-left": 49152, "front-right": 49152}, "gain": 1.5,
+    }
+    manager.restore()
+    assert changes == [(10, {"front-left": 32768, "front-right": 32768})]
+    assert not manager.journal
 
 
 def test_audio_commands_use_server_identity_and_target_stream(monkeypatch):
