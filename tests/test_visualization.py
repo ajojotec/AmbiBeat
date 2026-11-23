@@ -8,7 +8,7 @@ import sys
 import tempfile
 import threading
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 import urllib.error
 
 import numpy as np
@@ -96,14 +96,20 @@ def test_source_gain_is_remembered_if_stream_is_not_yet_available():
 def test_app_settings_are_saved_and_loaded_with_validated_values():
     settings = {
         "sample_rate": 96000,
+        "source_prompt_seconds": 18,
+        "source_prompt_enabled": False,
         "photosensitivity_warning_acknowledged": True,
         "source_gains": {"mpris:org.mpris.MediaPlayer2.player": 2.4},
         "selected_source": "mpris:org.mpris.MediaPlayer2.player",
+        "last_source_instances": {"player": "mpris:org.mpris.MediaPlayer2.player"},
         "visualizer_mode": 5,
         "scope_zero_line": False,
+        "scope_line_width": 175,
         "edge_swirl": True,
         "lighting_mode": "disco",
         "lighting_color_mode": "rainbow",
+        "disco_light_style": "bulb",
+        "disco_wire_color": "theme",
         "disco_light_count": 12,
         "disco_light_size": 150,
         "edge_swirl_direction": "random",
@@ -230,6 +236,7 @@ def test_backend_starts_and_stops(tmp_path, monkeypatch):
         assert backend.audio_thread.is_alive()
         assert backend.get_state()["selectedSource"] == ""
         assert backend.get_state()["scopeZeroLine"] is True
+        assert backend.get_state()["scopeLineWidth"] == 100
     finally:
         backend.stop()
     assert not backend.source_volume.active
@@ -256,6 +263,87 @@ def test_scope_zero_line_persists_and_rejects_invalid_values(tmp_path, monkeypat
         backend.update_setting("scope-zero-line", True)
     assert backend.scope_zero_line is False
     path.write_text(json.dumps({"scope_zero_line": "false"}), encoding="utf-8")
+    assert MODULE._load_app_settings() == {}
+
+
+def test_scope_line_width_validates_persists_and_rolls_back(tmp_path, monkeypatch):
+    path = tmp_path / "settings.json"
+    monkeypatch.setattr(MODULE, "APP_SETTINGS_PATH", str(path))
+    monkeypatch.setattr(MODULE, "LEGACY_APP_SETTINGS_PATH", str(tmp_path / "legacy.json"))
+    monkeypatch.setattr(MODULE, "ART_CACHE_DIR", str(tmp_path / "art"))
+    monkeypatch.setattr(MODULE.AmbiBeatBackend, "_refresh_system_volume", lambda self: True)
+    backend = MODULE.AmbiBeatBackend(SimpleNamespace(list_names=lambda: []))
+    try:
+        for value in (25, 300):
+            backend.update_setting("scope-line-width", value)
+            assert MODULE._load_app_settings()["scope_line_width"] == value
+            assert backend.get_state()["scopeLineWidth"] == value
+        for value in (24, 301, True, 1.5):
+            with pytest.raises(ValueError):
+                backend.update_setting("scope-line-width", value)
+        def fail_write(_settings):
+            raise OSError("disk full")
+        monkeypatch.setattr(MODULE, "_write_app_settings", fail_write)
+        with pytest.raises(OSError, match="disk full"):
+            backend.update_setting("scope-line-width", 100)
+        assert backend.scope_line_width == 300
+    finally:
+        backend.stop()
+    path.write_text(json.dumps({"scope_line_width": 301}), encoding="utf-8")
+    assert MODULE._load_app_settings() == {}
+
+
+def test_source_prompt_duration_persists_validates_and_rolls_back(tmp_path, monkeypatch):
+    path = tmp_path / "settings.json"
+    monkeypatch.setattr(MODULE, "APP_SETTINGS_PATH", str(path))
+    monkeypatch.setattr(MODULE, "LEGACY_APP_SETTINGS_PATH", str(tmp_path / "legacy.json"))
+    monkeypatch.setattr(MODULE, "ART_CACHE_DIR", str(tmp_path / "art"))
+    monkeypatch.setattr(MODULE.AmbiBeatBackend, "_refresh_system_volume", lambda self: True)
+    backend = MODULE.AmbiBeatBackend(SimpleNamespace(list_names=lambda: []))
+    try:
+        assert backend.get_state()["sourcePromptSeconds"] == 10
+        for value in (3, 60):
+            backend.update_setting("source-prompt-seconds", value)
+            assert MODULE._load_app_settings()["source_prompt_seconds"] == value
+            assert backend.get_state()["sourcePromptSeconds"] == value
+        for value in (2, 61, True, 2.5):
+            with pytest.raises(ValueError):
+                backend.update_setting("source-prompt-seconds", value)
+        def fail_write(_settings):
+            raise OSError("disk full")
+        monkeypatch.setattr(MODULE, "_write_app_settings", fail_write)
+        with pytest.raises(OSError, match="disk full"):
+            backend.update_setting("source-prompt-seconds", 10)
+        assert backend.source_prompt_seconds == 60
+    finally:
+        backend.stop()
+    path.write_text(json.dumps({"source_prompt_seconds": 61}), encoding="utf-8")
+    assert MODULE._load_app_settings() == {}
+
+
+def test_source_prompt_enabled_persists_validates_and_rolls_back(tmp_path, monkeypatch):
+    path = tmp_path / "settings.json"
+    monkeypatch.setattr(MODULE, "APP_SETTINGS_PATH", str(path))
+    monkeypatch.setattr(MODULE, "LEGACY_APP_SETTINGS_PATH", str(tmp_path / "legacy.json"))
+    monkeypatch.setattr(MODULE, "ART_CACHE_DIR", str(tmp_path / "art"))
+    monkeypatch.setattr(MODULE.AmbiBeatBackend, "_refresh_system_volume", lambda self: True)
+    backend = MODULE.AmbiBeatBackend(SimpleNamespace(list_names=lambda: []))
+    try:
+        assert backend.get_state()["sourcePromptEnabled"] is True
+        backend.update_setting("source-prompt-enabled", False)
+        assert MODULE._load_app_settings()["source_prompt_enabled"] is False
+        assert backend.get_state()["sourcePromptEnabled"] is False
+        with pytest.raises(ValueError):
+            backend.update_setting("source-prompt-enabled", 1)
+        def fail_write(_settings):
+            raise OSError("disk full")
+        monkeypatch.setattr(MODULE, "_write_app_settings", fail_write)
+        with pytest.raises(OSError, match="disk full"):
+            backend.update_setting("source-prompt-enabled", True)
+        assert backend.source_prompt_enabled is False
+    finally:
+        backend.stop()
+    path.write_text(json.dumps({"source_prompt_enabled": 1}), encoding="utf-8")
     assert MODULE._load_app_settings() == {}
 
 
@@ -479,6 +567,61 @@ def test_invalid_saved_lighting_color_mode_is_ignored():
             assert MODULE._load_app_settings() == {}
 
 
+def test_christmas_lighting_mode_is_saved_loaded_and_rolled_back(tmp_path, monkeypatch):
+    path = tmp_path / "settings.json"
+    monkeypatch.setattr(MODULE, "APP_SETTINGS_PATH", str(path))
+    monkeypatch.setattr(MODULE, "LEGACY_APP_SETTINGS_PATH", str(tmp_path / "legacy.json"))
+    backend = MODULE.AmbiBeatBackend.__new__(MODULE.AmbiBeatBackend)
+    backend.lighting_color_mode = "artwork"
+    backend._save_settings = lambda: MODULE._write_app_settings(
+        {"lighting_color_mode": backend.lighting_color_mode})
+    backend.update_setting("lighting-color-mode", "christmas")
+    assert MODULE._load_app_settings()["lighting_color_mode"] == "christmas"
+    with pytest.raises(ValueError):
+        backend.update_setting("lighting-color-mode", "invalid")
+
+    def fail_save():
+        raise OSError("disk full")
+    backend._save_settings = fail_save
+    with pytest.raises(OSError, match="disk full"):
+        backend.update_setting("lighting-color-mode", "rainbow")
+    assert backend.lighting_color_mode == "christmas"
+
+
+@pytest.mark.parametrize("setting,valid", [
+    ("disco_light_style", ("glow", "fairy", "bulb", "star")),
+    ("disco_wire_color", ("green", "theme", "none")),
+])
+def test_festive_light_settings_validate_persist_and_roll_back(setting, valid, tmp_path, monkeypatch, capsys):
+    backend = MODULE.AmbiBeatBackend.__new__(MODULE.AmbiBeatBackend)
+    setattr(backend, setting, valid[0])
+    saved = []
+    backend._save_settings = lambda: saved.append(getattr(backend, setting))
+    for value in valid:
+        backend.update_setting(setting.replace("_", "-"), value)
+    assert saved == list(valid)
+    with pytest.raises(ValueError):
+        backend.update_setting(setting.replace("_", "-"), "invalid")
+    assert getattr(backend, setting) == valid[-1]
+
+    def fail_save():
+        raise OSError("disk full")
+    backend._save_settings = fail_save
+    with pytest.raises(OSError, match="disk full"):
+        backend.update_setting(setting.replace("_", "-"), valid[0])
+    assert getattr(backend, setting) == valid[-1]
+
+    path = tmp_path / "settings.json"
+    monkeypatch.setattr(MODULE, "APP_SETTINGS_PATH", str(path))
+    monkeypatch.setattr(MODULE, "LEGACY_APP_SETTINGS_PATH", str(tmp_path / "legacy.json"))
+    for value in valid:
+        MODULE._write_app_settings({setting: value})
+        assert MODULE._load_app_settings()[setting] == value
+    path.write_text(json.dumps({setting: "invalid"}), encoding="utf-8")
+    assert MODULE._load_app_settings() == {}
+    assert "Ignoring invalid saved" in capsys.readouterr().out
+
+
 @pytest.mark.parametrize("setting,minimum,maximum", [
     ("disco_light_count", 3, 40), ("disco_light_size", 40, 200),
 ])
@@ -535,14 +678,20 @@ def test_state_exposes_selected_and_resolved_rotation_direction():
     }
     backend.bars, backend.wave = [], []
     backend.sample_rate = 48000
+    backend.source_prompt_seconds = 10
+    backend.source_prompt_enabled = True
     backend.source_volume = SimpleNamespace(gains={})
+    backend.last_source_instances = {}
     backend.boost_warning = ""
     backend.photosensitivity_warning_acknowledged = False
     backend.visualizer_mode = 1
     backend.scope_zero_line = True
+    backend.scope_line_width = 100
     backend.edge_swirl = True
     backend.lighting_mode = "disco"
     backend.lighting_color_mode = "rainbow"
+    backend.disco_light_style = "bulb"
+    backend.disco_wire_color = "theme"
     backend.disco_light_count = 12
     backend.disco_light_size = 150
     backend.edge_swirl_slowdown = 1
@@ -562,11 +711,14 @@ def test_state_exposes_selected_and_resolved_rotation_direction():
     assert state["artworkMode"] == "logo"
     assert state["lightingMode"] == "disco"
     assert state["lightingColorMode"] == "rainbow"
+    assert state["discoLightStyle"] == "bulb"
+    assert state["discoWireColor"] == "theme"
     assert state["edgeDepth"] == 150
     assert state["discoLightCount"] == 12
     assert state["discoLightSize"] == 150
     assert state["sources"] == [
-        {"id": "mpris:org.mpris.MediaPlayer2.player", "label": "Player", "status": "playing"},
+        {"id": "mpris:org.mpris.MediaPlayer2.player", "label": "Player", "status": "playing",
+         "identity": "", "application": "", "desktopEntry": "", "lastSelected": False},
     ]
 
 
@@ -704,10 +856,12 @@ def test_switching_mpris_sources_pauses_other_players_and_plays_selected():
     other_source = "mpris:org.mpris.MediaPlayer2.other"
     target_source = "mpris:org.mpris.MediaPlayer2.target"
     backend.selected_source = old_source
-    backend._source_choice_made = True
+    backend.last_source_instances = {}
     backend._mpris_players = {
         source.removeprefix("mpris:"): {
             "id": source,
+            "identity": source,
+            "application": source,
             "track": {"title": "Track", "artist": "Artist", "album": "", "status": status},
             "art_url": "",
         }
@@ -738,6 +892,100 @@ def test_switching_mpris_sources_pauses_other_players_and_plays_selected():
     ]
     assert backend.set_source("bluetooth") == (False, "")
     assert backend.selected_source == target_source
+    assert backend.last_source_instances[target_source] == target_source
+
+
+def test_source_refresh_prefers_last_selected_instance_and_preserves_current(monkeypatch):
+    first = "org.mpris.MediaPlayer2.example.instance1"
+    last = "org.mpris.MediaPlayer2.example.instance2"
+    available = [first, last]
+    class Properties:
+        def __init__(self, name):
+            self.name = name
+
+        def GetAll(self, interface):
+            if interface == "org.mpris.MediaPlayer2":
+                return {"Identity": "Example Web Browser" if self.name == first else "Example",
+                        "DesktopEntry": "example-app"}
+            return {"PlaybackStatus": "Playing" if self.name == first else "Paused", "Metadata": {}}
+
+    backend = MODULE.AmbiBeatBackend.__new__(MODULE.AmbiBeatBackend)
+    backend.session_bus = SimpleNamespace(list_names=lambda: available,
+                                          get_object=lambda name, *_args, **_kwargs: name)
+    monkeypatch.setattr(MODULE.dbus, "Interface", lambda name, _interface: Properties(name))
+    backend._mpris_errors = set()
+    backend.selected_source = "mpris:org.mpris.MediaPlayer2.missing"
+    backend.last_source_instances = {"example": "mpris:" + last}
+    backend.source_volume = SimpleNamespace(lock=threading.RLock(), restore=Mock())
+    backend._publish_track = Mock()
+    backend._sync_idle_inhibition = Mock()
+    backend._refresh_mpris_players()
+    assert backend.selected_source == "mpris:" + last
+    assert backend._mpris_players[last]["desktop_entry"] == "example-app"
+
+    backend.selected_source = "mpris:" + first
+    backend._refresh_mpris_players()
+    assert backend.selected_source == "mpris:" + first
+    backend.selected_source = "mpris:org.mpris.MediaPlayer2.missing"
+    available.remove(last)
+    backend._refresh_mpris_players()
+    assert backend.selected_source == "mpris:" + first
+
+
+def test_last_selected_instances_survive_backend_restart(tmp_path, monkeypatch):
+    monkeypatch.setattr(MODULE, "APP_SETTINGS_PATH", str(tmp_path / "settings.json"))
+    monkeypatch.setattr(MODULE, "LEGACY_APP_SETTINGS_PATH", str(tmp_path / "legacy.json"))
+    monkeypatch.setattr(MODULE, "ART_CACHE_DIR", str(tmp_path / "art"))
+    monkeypatch.setattr(MODULE.AmbiBeatBackend, "_refresh_system_volume", lambda self: True)
+    monkeypatch.setattr(MODULE.AmbiBeatBackend, "_publish_track", lambda *_args: None)
+    first = "org.mpris.MediaPlayer2.example.instance1"
+    last = "org.mpris.MediaPlayer2.example.instance2"
+    bus = SimpleNamespace(list_names=lambda: [])
+    backend = MODULE.AmbiBeatBackend(bus)
+    try:
+        backend._mpris_players = {
+            last: {"id": "mpris:" + last, "identity": "Example", "application": "example",
+                   "track": {"status": "paused"}, "art_url": ""},
+        }
+        monkeypatch.setattr(backend.source_volume, "apply", lambda _source: None)
+        monkeypatch.setattr(backend, "_mpris_control_warning", lambda *_args: "")
+        assert backend.set_source("mpris:" + last)[0]
+        assert MODULE._load_app_settings()["last_source_instances"] == {"example": "mpris:" + last}
+    finally:
+        backend.stop()
+
+    class Properties:
+        def __init__(self, name):
+            self.name = name
+
+        def GetAll(self, interface):
+            if interface == "org.mpris.MediaPlayer2":
+                return {"Identity": "Example", "DesktopEntry": "example-app"}
+            return {"PlaybackStatus": "Playing" if self.name == first else "Paused", "Metadata": {}}
+
+    bus = SimpleNamespace(list_names=lambda: [first, last],
+                          get_object=lambda name, *_args, **_kwargs: name)
+    monkeypatch.setattr(MODULE.dbus, "Interface", lambda name, _interface: Properties(name))
+    backend = MODULE.AmbiBeatBackend(bus)
+    try:
+        assert backend.selected_source == "mpris:" + last
+        sources = backend.get_state()["sources"]
+        assert next(item for item in sources if item["id"] == "mpris:" + last)["lastSelected"]
+    finally:
+        backend.stop()
+
+
+def test_saved_source_instances_reject_invalid_entries(tmp_path, monkeypatch, capsys):
+    path = tmp_path / "settings.json"
+    monkeypatch.setattr(MODULE, "APP_SETTINGS_PATH", str(path))
+    monkeypatch.setattr(MODULE, "LEGACY_APP_SETTINGS_PATH", str(tmp_path / "legacy.json"))
+    path.write_text(json.dumps({"last_source_instances": {
+        "Example": "mpris:org.mpris.MediaPlayer2.example",
+        "Invalid": "bluetooth", "": "mpris:org.mpris.MediaPlayer2.other",
+    }}), encoding="utf-8")
+    assert MODULE._load_app_settings()["last_source_instances"] == {
+        "Example": "mpris:org.mpris.MediaPlayer2.example"}
+    assert "Ignoring invalid saved playback instance" in capsys.readouterr().out
 
 
 def test_find_matching_album_cover_skips_unrelated_first_result():
@@ -1343,3 +1591,53 @@ def test_mpris_track_info_reads_artist_album_status_and_art_url():
     assert track["status"] == "playing"
     assert art_url == "file:///tmp/cover.jpg"
     assert pid == "1234"
+
+
+def test_mpris_timeline_progress_and_seek(tmp_path, monkeypatch):
+    monkeypatch.setattr(MODULE, "APP_SETTINGS_PATH", str(tmp_path / "settings.json"))
+    monkeypatch.setattr(MODULE, "LEGACY_APP_SETTINGS_PATH", str(tmp_path / "legacy.json"))
+    monkeypatch.setattr(MODULE, "ART_CACHE_DIR", str(tmp_path / "art"))
+    monkeypatch.setattr(MODULE.AmbiBeatBackend, "_refresh_system_volume", lambda self: True)
+    bus = Mock()
+    bus.list_names.return_value = []
+    backend = MODULE.AmbiBeatBackend(bus)
+    try:
+        monkeypatch.setattr(MODULE.time, "monotonic", lambda: 10.0)
+        track, _, _ = MODULE._mpris_track_info("Player", {
+            "PlaybackStatus": "Playing", "Position": 20_000_000, "Rate": 2.0, "CanSeek": True,
+            "Metadata": {"mpris:trackid": "/track/1", "mpris:length": 100_000_000},
+        })
+        backend.track_info = track
+        backend.selected_source = "mpris:org.mpris.MediaPlayer2.test"
+        backend._mpris_players = {"org.mpris.MediaPlayer2.test": {
+            "id": backend.selected_source, "label": "Player", "track": track,
+        }}
+        monkeypatch.setattr(MODULE.time, "monotonic", lambda: 15.0)
+        assert backend.get_state()["track"]["position"] == 30_000_000
+        track["status"] = "paused"
+        assert backend.get_state()["track"]["position"] == 20_000_000
+        player = Mock()
+        monkeypatch.setattr(MODULE.dbus, "Interface", lambda *_args: player)
+        backend.seek_track(backend.selected_source, "/track/1", 50_000_000)
+        player.SetPosition.assert_called_once_with("/track/1", 50_000_000)
+        assert backend.get_state()["track"]["position"] == 50_000_000
+        for source, track_id, position in (
+            ("mpris:other", "/track/1", 1), (backend.selected_source, "/track/2", 1),
+            (backend.selected_source, "/track/1", 100_000_001),
+        ):
+            with pytest.raises(ValueError):
+                backend.seek_track(source, track_id, position)
+        assert player.SetPosition.call_count == 1
+    finally:
+        backend.stop()
+
+
+@pytest.mark.parametrize("properties", [
+    {"Position": 0, "CanSeek": False, "Metadata": {"mpris:trackid": "/track/1", "mpris:length": 1}},
+    {"Position": 0, "CanSeek": True, "Metadata": {"mpris:trackid": "/track/1"}},
+    {"CanSeek": True, "Metadata": {"mpris:trackid": "/track/1", "mpris:length": 1}},
+    {"Position": 0, "CanSeek": True, "Metadata": {"mpris:length": 1}},
+])
+def test_mpris_timeline_unavailable_without_required_metadata(properties):
+    track, _, _ = MODULE._mpris_track_info("Player", properties)
+    assert not track["canSeek"]

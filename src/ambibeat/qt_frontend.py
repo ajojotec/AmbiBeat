@@ -12,7 +12,7 @@ import shiboken6
 import dbus
 import dbus.mainloop.glib
 
-from PySide6.QtCore import QEasingCurve, QEvent, QPoint, QPropertyAnimation, QRect, QRectF, Qt, QTimer
+from PySide6.QtCore import QEasingCurve, QEvent, QPoint, QPropertyAnimation, QRect, QRectF, QSignalBlocker, Qt, QTimer
 from PySide6.QtGui import (
     QColor,
     QIcon,
@@ -30,6 +30,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QGraphicsDropShadowEffect,
     QGraphicsOpacityEffect,
     QHBoxLayout,
     QLabel,
@@ -40,15 +41,17 @@ from PySide6.QtWidgets import (
     QToolButton,
     QSizePolicy,
     QSpacerItem,
+    QStyle,
+    QStyleOptionSlider,
     QVBoxLayout,
     QWidget,
     QWidgetAction,
 )
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 
-from .backend import APP_ICON_PATH, AmbiBeatBackend
+from .backend import APP_ICON_PATH, SOURCE_PROMPT_SECONDS_DEFAULT, AmbiBeatBackend
 from .qt_gpu import BorderShader, gpu_available
-from .qt_panels import SidePanel, WheelIgnoringSlider
+from .qt_panels import SidePanel, WheelIgnoringSlider, source_icon
 
 
 QT_MODES = (
@@ -58,6 +61,52 @@ QT_MODES = (
     (4, "Time Vortex"),
     (5, "No visualisation"),
 )
+CHRISTMAS_COLORS = ("#e42c3e", "#36c66a", "#ffd575")
+
+
+def format_track_time(microseconds):
+    seconds = max(0, microseconds // 1_000_000)
+    hours, seconds = divmod(seconds, 3600)
+    minutes, seconds = divmod(seconds, 60)
+    return f"{hours}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes}:{seconds:02d}"
+
+
+class TimelineSlider(WheelIgnoringSlider):
+    def set_position_from_mouse(self, event):
+        option = QStyleOptionSlider()
+        self.initStyleOption(option)
+        groove = self.style().subControlRect(QStyle.ComplexControl.CC_Slider, option,
+                                             QStyle.SubControl.SC_SliderGroove, self)
+        handle = self.style().subControlRect(QStyle.ComplexControl.CC_Slider, option,
+                                             QStyle.SubControl.SC_SliderHandle, self)
+        span = max(1, groove.width() - handle.width())
+        position = round(event.position().x() - groove.x() - handle.width() / 2)
+        self.setSliderPosition(QStyle.sliderValueFromPosition(
+            self.minimum(), self.maximum(), position, span, option.upsideDown
+        ))
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.setSliderDown(True)
+            self.set_position_from_mouse(event)
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self.isSliderDown() and event.buttons() & Qt.MouseButton.LeftButton:
+            self.set_position_from_mouse(event)
+            event.accept()
+        else:
+            super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self.isSliderDown():
+            self.set_position_from_mouse(event)
+            self.setSliderDown(False)
+            event.accept()
+        else:
+            super().mouseReleaseEvent(event)
 
 
 def disco_light_positions(width, height, count):
@@ -72,6 +121,38 @@ def disco_light_positions(width, height, count):
     )
 
 
+def festive_strand_geometry(width, height, count, unit):
+    positions = disco_light_positions(width, height, count)
+    top_count = sum(y == 0 for x, y in positions)
+    left_count = sum(x == 0 for x, y in positions)
+    right_count = count - top_count - left_count
+    top_bend = min(unit * .8, width / top_count * .16)
+    left_bend = min(unit * .8, height / left_count * .16)
+    right_bend = min(unit * .8, height / right_count * .16)
+    path = QPainterPath()
+    path.moveTo(0, 2)
+    for index in range(top_count):
+        path.quadTo(width * (index + .5) / top_count, 2 + 2 * top_bend,
+                    width * (index + 1) / top_count, 2)
+    path.moveTo(2, 0)
+    for index in range(left_count):
+        path.quadTo(2 + 2 * left_bend, height * (index + .5) / left_count,
+                    2, height * (index + 1) / left_count)
+    path.moveTo(width - 2, 0)
+    for index in range(right_count):
+        path.quadTo(width - 2 - 2 * right_bend, height * (index + .5) / right_count,
+                    width - 2, height * (index + 1) / right_count)
+    bulbs = []
+    for x, y in positions:
+        if y == 0:
+            bulbs.append((x, 2 + top_bend, 0))
+        elif x == 0:
+            bulbs.append((2 + left_bend, y, -90))
+        else:
+            bulbs.append((width - 2 - right_bend, y, 90))
+    return path, bulbs
+
+
 def scope_gradient(width, active_palette):
     colors = (active_palette["colors"] if active_palette else
               [QColor("#37ff9a"), QColor("#baff8a"), QColor("#37ff9a")])
@@ -81,16 +162,16 @@ def scope_gradient(width, active_palette):
     return gradient
 
 
-def paint_scope_path(painter, path, gradient):
+def paint_scope_path(painter, path, gradient, line_width=3.5):
     painter.setBrush(Qt.BrushStyle.NoBrush)
     painter.setOpacity(1)
     underlay = QPen(QColor(9, 11, 18, 190))
-    underlay.setWidthF(7)
+    underlay.setWidthF(line_width * 2)
     underlay.setCapStyle(Qt.PenCapStyle.RoundCap)
     underlay.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
     painter.setPen(underlay)
     painter.drawPath(path)
-    for width, opacity in ((14, .06), (9, .12)):
+    for width, opacity in ((line_width * 4, .06), (line_width * 18 / 7, .12)):
         painter.setOpacity(opacity)
         glow_pen = QPen(gradient, width)
         glow_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
@@ -98,7 +179,7 @@ def paint_scope_path(painter, path, gradient):
         painter.setPen(glow_pen)
         painter.drawPath(path)
     painter.setOpacity(1)
-    pen = QPen(gradient, 3.5)
+    pen = QPen(gradient, line_width)
     pen.setCapStyle(Qt.PenCapStyle.RoundCap)
     pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
     painter.setPen(pen)
@@ -138,7 +219,8 @@ class MovingEdgeBorder(QWidget):
 
     def border_palette(self, state):
         colors = self.adjusted_colors(state)
-        if not state.get("edgeSwirl") and state.get("lightingColorMode") != "rainbow":
+        if (not state.get("edgeSwirl")
+                and state.get("lightingColorMode") not in ("rainbow", "christmas")):
             return [colors[1 % len(colors)], colors[2 % len(colors)],
                     colors[0], colors[1 % len(colors)]]
         return colors + list(reversed(colors))
@@ -165,6 +247,8 @@ class MovingEdgeBorder(QWidget):
             end = max(start + 1, (index + 1) * len(bars) // count)
             band = bars[start:end] if playing else []
             level = sum(band) / len(band) if band else 0
+            if playing:
+                level = .3 + .7 * min(1, max(0, level))
             decay = (.18 + fade * .62) * (1 + index * .16)
             self.disco_levels[index] = max(
                 min(1, max(0, level)),
@@ -179,6 +263,10 @@ class MovingEdgeBorder(QWidget):
         radius = min(width, height) * .18 * float(state.get("discoLightSize", 100)) / 100
         colors = self.adjusted_colors(state)
         count = int(state.get("discoLightCount", 16))
+        style = state.get("discoLightStyle", "glow")
+        if style != "glow":
+            self.paint_festive_lights(painter, state, colors, radius, count, style)
+            return
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setPen(Qt.PenStyle.NoPen)
         for index, (x, y) in enumerate(disco_light_positions(width, height, count)):
@@ -199,6 +287,92 @@ class MovingEdgeBorder(QWidget):
             painter.setBrush(glow)
             painter.drawEllipse(QRectF(-radius, -radius, 2 * radius, 2 * radius))
             painter.restore()
+
+    def paint_festive_lights(self, painter, state, colors, radius, count, style):
+        width, height = self.width(), self.height()
+        unit = radius * .14
+        wire_path, positions = festive_strand_geometry(width, height, count, unit)
+        fade = float(state.get("edgeFade", 50)) / 100
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        for index, (x, y, angle) in enumerate(positions):
+            level = self.disco_levels[index % len(colors)]
+            if level <= .001:
+                continue
+            painter.save()
+            painter.translate(x, y)
+            painter.rotate(angle)
+            color = colors[index % len(colors)]
+            glow = QRadialGradient(0, unit * 1.3, radius * .55)
+            for position in (0, .5, 1):
+                stop = QColor(color)
+                stop.setAlphaF(color.alphaF() * (1 - position) ** (2.4 - 1.8 * fade) * .55)
+                glow.setColorAt(position, stop)
+            painter.setBrush(glow)
+            painter.setOpacity(level)
+            painter.drawEllipse(QRectF(-radius * .55, unit * 1.3 - radius * .55,
+                                       radius * 1.1, radius * 1.1))
+            painter.restore()
+
+        wire_color_mode = state.get("discoWireColor", "green")
+        if wire_color_mode != "none":
+            if wire_color_mode == "theme":
+                wire = QConicalGradient(width / 2, height / 2, 0)
+                for index, color in enumerate(colors + [colors[0]]):
+                    wire.setColorAt(index / len(colors), color)
+                pen = QPen(wire, max(1.0, unit * .15))
+            else:
+                wire_color = QColor("#417a4c")
+                wire_color.setAlphaF(self.opacity * .85)
+                pen = QPen(wire_color, max(1.0, unit * .15))
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawPath(wire_path)
+
+        for index, (x, y, angle) in enumerate(positions):
+            level = self.disco_levels[index % len(colors)]
+            painter.save()
+            painter.translate(x, y)
+            painter.rotate(angle)
+            painter.scale(unit, unit)
+            painter.setPen(Qt.PenStyle.NoPen)
+            if wire_color_mode != "none":
+                socket = QColor("#486753")
+                socket.setAlphaF(self.opacity * .9)
+                painter.setBrush(socket)
+                painter.drawRoundedRect(QRectF(-.35, .1, .7, .55), .1, .1)
+            if level > .001:
+                color = colors[index % len(colors)]
+                gradient = QLinearGradient(-.7, .5, .7, 2.2)
+                gradient.setColorAt(0, color.lighter(160))
+                gradient.setColorAt(.5, color)
+                gradient.setColorAt(1, color.darker(150))
+                painter.setOpacity(level)
+                painter.setBrush(gradient)
+                if style == "fairy":
+                    painter.drawEllipse(QRectF(-.65, .55, 1.3, 1.3))
+                elif style == "bulb":
+                    path = QPainterPath()
+                    path.moveTo(-.45, .55)
+                    path.cubicTo(-1.1, 1.1, -.8, 2.0, 0, 2.55)
+                    path.cubicTo(.8, 2.0, 1.1, 1.1, .45, .55)
+                    path.closeSubpath()
+                    painter.drawPath(path)
+                elif style == "star":
+                    path = QPainterPath()
+                    for point in range(10):
+                        angle = -math.pi / 2 + point * math.pi / 5
+                        distance = .85 if point % 2 == 0 else .38
+                        px, py = distance * math.cos(angle), 1.4 + distance * math.sin(angle)
+                        if point == 0:
+                            path.moveTo(px, py)
+                        else:
+                            path.lineTo(px, py)
+                    path.closeSubpath()
+                    painter.drawPath(path)
+            painter.restore()
+        painter.restore()
 
     def paint_border(self, painter, state):
         mode = state.get("lightingMode", "border")
@@ -242,6 +416,11 @@ class VisualizerRenderer:
         self.background_cache = None
         self.background_palette = None
         self.background_size = None
+        self.christmas_background = {
+            "base": QColor("#07150e"),
+            "background": [QColor("#1a3b24"), QColor("#492024"),
+                           QColor("#173d28"), QColor("#3a1c1b"), QColor("#233421")],
+        }
         self.halo_fade_key = None
         self.halo_fade_texture = None
         self.peaks = []
@@ -351,6 +530,16 @@ class VisualizerRenderer:
             return self.logo_palette
         return self.track_palette
 
+    def effect_palette(self):
+        mode = self.state.get("lightingColorMode", "artwork")
+        if mode == "christmas":
+            return {"colors": [QColor(color) for color in CHRISTMAS_COLORS]}
+        if mode == "rainbow":
+            count = int(self.state.get("edgeColorCount", 8))
+            return {"colors": [QColor.fromHslF(index / count, 1, .5)
+                               for index in (0, count // 3, 2 * count // 3)]}
+        return self.active_palette()
+
     def sample_palette(self, pixmap):
         image = pixmap.toImage().scaled(
             24, 24, Qt.AspectRatioMode.IgnoreAspectRatio,
@@ -405,8 +594,10 @@ class VisualizerRenderer:
         }
 
     def paint_background(self, painter, width, height):
-        palette = (None if self.state.get("lightingColorMode") == "rainbow"
-                   else self.active_palette())
+        color_mode = self.state.get("lightingColorMode")
+        palette = (None if color_mode == "rainbow" else
+                   self.christmas_background if color_mode == "christmas" else
+                   self.active_palette())
         size = (width, height, self.devicePixelRatioF())
         if (self.background_cache is not None and self.background_size == size
                 and self.background_palette is palette):
@@ -517,7 +708,7 @@ class VisualizerRenderer:
         halo_radius = halo_size * .23
 
         self.paint_background(painter, width, height)
-        active_palette = self.active_palette()
+        active_palette = self.effect_palette()
 
         status = str((self.state.get("track") or {}).get("status", ""))
         playing = status == "playing"
@@ -615,8 +806,10 @@ class VisualizerRenderer:
                     painter.setPen(Qt.PenStyle.NoPen)
                     painter.drawRect(QRectF(x, layout_bottom - bar_height, bar_width, bar_height))
                     painter.setOpacity(1)
+                    peak_color = (palette[-1] if self.state.get("lightingColorMode")
+                                  in ("rainbow", "christmas") else QColor("#80d8ff"))
                     painter.fillRect(QRectF(x, layout_bottom - self.peaks[index] * layout_height * .58 - 1,
-                                            bar_width, 2), QColor("#80d8ff"))
+                                            bar_width, 2), peak_color)
 
         elif qt_mode == 1:
             gradient = scope_gradient(width, active_palette)
@@ -645,7 +838,8 @@ class VisualizerRenderer:
                         path.moveTo(x, y)
                     else:
                         path.lineTo(x, y)
-                paint_scope_path(scope_painter, path, gradient)
+                paint_scope_path(scope_painter, path, gradient,
+                                 3.5 * self.state.get("scopeLineWidth", 100) / 100)
                 if scale < 1:
                     scope_painter.end()
                     painter.setOpacity(1)
@@ -673,7 +867,7 @@ class VisualizerRenderer:
                 path = QPainterPath()
                 for index, value in enumerate(bars):
                     angle = index / len(bars) * math.tau - math.pi / 2
-                    ring_radius = base_radius + value * halo_size * .22
+                    ring_radius = base_radius + halo_size * (value * .18 + halo_bass * .04)
                     x = cx + math.cos(angle) * ring_radius
                     y = cy + math.sin(angle) * ring_radius
                     if index == 0:
@@ -681,7 +875,8 @@ class VisualizerRenderer:
                     else:
                         path.lineTo(x, y)
                 path.closeSubpath()
-                paint_scope_path(painter, path, scope_gradient(width, active_palette))
+                paint_scope_path(painter, path, scope_gradient(width, active_palette),
+                                 3.5 * self.state.get("scopeLineWidth", 100) / 100)
 
         elif qt_mode == 2:
             palette = (
@@ -970,7 +1165,14 @@ class AmbiBeatQtWindow(QMainWindow):
         self.track_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.track_artist.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.track_title.setStyleSheet("background: transparent; font-size: 28px; font-weight: 700;")
-        self.track_artist.setStyleSheet("background: transparent; color: #bbb; font-size: 18px;")
+        self.track_artist.setStyleSheet(
+            "background: transparent; color: rgba(255,255,255,102); font-size: 18px;"
+        )
+        artist_shadow = QGraphicsDropShadowEffect(self.track_artist)
+        artist_shadow.setColor(QColor(0, 0, 0, 230))
+        artist_shadow.setBlurRadius(6)
+        artist_shadow.setOffset(0, 1)
+        self.track_artist.setGraphicsEffect(artist_shadow)
         self.track_title.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.track_artist.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.track_title.setParent(central)
@@ -1046,7 +1248,27 @@ class AmbiBeatQtWindow(QMainWindow):
         self.controls_container = controls_widget
         controls_widget.setObjectName("controlsContainer")
         controls_widget.setStyleSheet("QWidget#controlsContainer { background: transparent; }")
-        controls_widget.setLayout(controls)
+        controls_layout = QVBoxLayout(controls_widget)
+        controls_layout.setContentsMargins(0, 0, 0, 0)
+        controls_layout.setSpacing(2)
+        self.timeline_container = QWidget()
+        timeline = QHBoxLayout(self.timeline_container)
+        timeline.setContentsMargins(16, 0, 16, 0)
+        timeline.addStretch()
+        self.timeline_elapsed = QLabel("--:--")
+        self.timeline_remaining = QLabel("--:--")
+        self.timeline_slider = TimelineSlider(Qt.Orientation.Horizontal)
+        self.timeline_slider.setAccessibleName("Track position")
+        self.timeline_slider.setRange(0, 1)
+        self.timeline_slider.setMaximumWidth(460)
+        self.timeline_slider.setMinimumWidth(120)
+        self._timeline_theme = None
+        timeline.addWidget(self.timeline_elapsed)
+        timeline.addWidget(self.timeline_slider, 1)
+        timeline.addWidget(self.timeline_remaining)
+        timeline.addStretch()
+        controls_layout.addWidget(self.timeline_container)
+        controls_layout.addLayout(controls)
         controls_widget.setContentsMargins(0, 0, 0, 0)
         self.controls_effect = QGraphicsOpacityEffect(controls_widget)
         controls_widget.setGraphicsEffect(self.controls_effect)
@@ -1063,7 +1285,44 @@ class AmbiBeatQtWindow(QMainWindow):
         self.setCentralWidget(central)
         self.edge_border.setGeometry(self.visualizer.rect())
 
+        self.source_prompt = QWidget(central)
+        self.source_prompt.setObjectName("sourcePrompt")
+        self.source_prompt.setAccessibleName("Playback source switch prompt")
+        self.source_prompt.setStyleSheet("""
+            QWidget#sourcePrompt {
+                background: #101a35; border: 1px solid #718cc1; border-radius: 8px;
+            }
+            QLabel { background: transparent; color: white; font-size: 13px; border: 0; }
+            QPushButton {
+                min-width: 0; min-height: 0; padding: 8px 12px;
+                border: 1px solid #718cc1; border-radius: 6px; background: #1b305a;
+            }
+            QPushButton:hover { background: #315590; }
+        """)
+        prompt_layout = QHBoxLayout(self.source_prompt)
+        prompt_layout.setContentsMargins(12, 8, 12, 8)
+        self.source_prompt_label = QLabel()
+        self.source_prompt_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.source_prompt_label.setWordWrap(True)
+        self.source_prompt_switch = QPushButton("Switch")
+        self.source_prompt_dismiss = QPushButton("Keep current")
+        prompt_layout.addWidget(self.source_prompt_label, 1)
+        prompt_layout.addWidget(self.source_prompt_switch)
+        prompt_layout.addWidget(self.source_prompt_dismiss)
+        self.source_prompt.hide()
+        self.source_prompt_timer = QTimer(self)
+        self.source_prompt_timer.setSingleShot(True)
+        self.source_prompt_timer.timeout.connect(self.dismiss_source_prompt)
+        self.source_prompt_switch.clicked.connect(self.accept_source_prompt)
+        self.source_prompt_dismiss.clicked.connect(self.dismiss_source_prompt)
+        self._source_statuses = None
+        self._source_prompt_id = None
+        self._pending_source_prompts = []
+
         self.state = {}
+        self._volume_slider = None
+        self.update_timeline_theme(None)
+        self._timeline_drag = None
         self._last_refresh_error = ""
         self.side_panel = None
         self.panel_animation = None
@@ -1084,6 +1343,9 @@ class AmbiBeatQtWindow(QMainWindow):
         self.settings_button.clicked.connect(self.open_settings)
         self.fullscreen_button.clicked.connect(self.toggle_fullscreen)
         self.volume_button.clicked.connect(self.open_volume_menu)
+        self.timeline_slider.sliderPressed.connect(self.start_timeline_drag)
+        self.timeline_slider.sliderReleased.connect(self.finish_timeline_drag)
+        self.timeline_slider.valueChanged.connect(self.timeline_value_changed)
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh_state)
@@ -1133,8 +1395,12 @@ class AmbiBeatQtWindow(QMainWindow):
 
     def eventFilter(self, watched, event):
         background = watched in (self.visualizer, self.centralWidget(), self.controls_container)
+        in_source_prompt = isinstance(watched, QWidget) and (
+            watched is self.source_prompt or self.source_prompt.isAncestorOf(watched)
+        )
         if (event.type() == QEvent.Type.MouseButtonPress
                 and self.side_panel is not None
+                and not in_source_prompt
                 and watched is not (self.mode_button if self.side_panel.kind == "visual"
                                     else self.settings_button)
                 and isinstance(watched, QWidget)
@@ -1145,6 +1411,9 @@ class AmbiBeatQtWindow(QMainWindow):
                 return True
             if background:
                 return True
+        if (watched in (self.timeline_container, self.source_prompt)
+                and event.type() in (QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonDblClick)):
+            return True
         if (event.type() == QEvent.Type.KeyPress and event.key() == Qt.Key.Key_Escape
                 and self.side_panel is not None):
             self.close_side_panel()
@@ -1172,7 +1441,7 @@ class AmbiBeatQtWindow(QMainWindow):
         menu = QMenu(self)
         selected = self.state.get("selectedSource")
         for source in self.state.get("sources") or []:
-            action = menu.addAction(source["label"])
+            action = menu.addAction(source_icon(source), source["label"])
             action.setCheckable(True)
             action.setChecked(source["id"] == selected)
             action.triggered.connect(
@@ -1194,21 +1463,35 @@ class AmbiBeatQtWindow(QMainWindow):
 
     def open_volume_menu(self):
         menu = QMenu(self)
+        menu.setStyleSheet("""
+            QMenu { background: #101a35; border: 1px solid #718cc1; padding: 8px; }
+        """)
         slider = WheelIgnoringSlider(Qt.Orientation.Vertical)
+        slider.setAccessibleName("System volume")
         slider.setRange(0, 100)
-        slider.setMinimumHeight(120)
-        slider.setValue(int(self.state.get("systemVolume") or 0))
+        slider.setFixedSize(32, 140)
+        volume = self.state.get("systemVolume")
+        slider.setEnabled(volume is not None)
+        slider.setValue(int(volume) if volume is not None else 0)
+        slider.setStyleSheet(self.themed_slider_style(self._timeline_theme, vertical=True))
+        self._volume_slider = slider
         action = QWidgetAction(menu)
         action.setDefaultWidget(slider)
         menu.addAction(action)
-        slider.valueChanged.connect(
-            self.change_system_volume
-        )
+        def change_volume(value):
+            previous = self.state.get("systemVolume")
+            if not self.change_system_volume(value) and previous is not None:
+                with QSignalBlocker(slider):
+                    slider.setValue(previous)
+        slider.valueChanged.connect(change_volume)
         self.controls_timer.stop()
         self.cursor_timer.stop()
         try:
-            menu.exec(self.volume_button.mapToGlobal(self.volume_button.rect().topLeft()))
+            size = menu.sizeHint()
+            offset = QPoint((self.volume_button.width() - size.width()) // 2, -size.height())
+            menu.exec(self.volume_button.mapToGlobal(offset))
         finally:
+            self._volume_slider = None
             self.show_controls()
             self.show_fullscreen_cursor()
 
@@ -1222,6 +1505,9 @@ class AmbiBeatQtWindow(QMainWindow):
 
     def hide_controls(self):
         if self.side_panel is not None:
+            return
+        if self.timeline_slider.isSliderDown():
+            self.controls_timer.start(2500)
             return
         self.controls_effect.setOpacity(0)
         self.position_metadata()
@@ -1243,6 +1529,8 @@ class AmbiBeatQtWindow(QMainWindow):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self.position_metadata()
+        if hasattr(self, "source_prompt"):
+            self.position_source_prompt()
         if hasattr(self, "visualizer") and shiboken6.isValid(self.visualizer):
             central = self.centralWidget()
             if central is not None:
@@ -1275,18 +1563,93 @@ class AmbiBeatQtWindow(QMainWindow):
             f"background: transparent; font-size: {title_size}px; font-weight: 700;"
         )
         self.track_artist.setStyleSheet(
-            f"background: transparent; color: #bbb; font-size: {artist_size}px;"
+            f"background: transparent; color: {self.control_border_color or 'rgba(255,255,255,102)'};"
+            f" font-size: {artist_size}px;"
         )
-        self.track_artist.setGeometry(int(width * .04), int(height - bottom - 25),
-                                      title_width, 25)
-        self.track_title.setGeometry(int(width * .04), int(height - bottom - 25 - title_size * 1.3),
-                                     title_width, int(title_size * 1.3))
+        artist_height = max(25, self.track_artist.fontMetrics().height() + 4)
+        title_height = max(math.ceil(title_size * 1.3), self.track_title.fontMetrics().height() + 4)
+        artist_top = int(height - bottom - artist_height)
+        self.track_artist.setGeometry(int(width * .04), artist_top, title_width, artist_height)
+        self.track_title.setGeometry(int(width * .04), artist_top - title_height,
+                                     title_width, title_height)
         spacer_height = height - self.track_title.y()
         if self.metadata_spacer.sizeHint().height() != spacer_height:
             self.metadata_spacer.changeSize(
                 0, spacer_height, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed
             )
             central.layout().invalidate()
+
+    def position_source_prompt(self):
+        width = min(620, max(1, self.centralWidget().width() - 24))
+        self.source_prompt.setFixedWidth(width)
+        self.source_prompt.adjustSize()
+        self.source_prompt.move((self.centralWidget().width() - width) // 2, 12)
+
+    def update_source_prompts(self, sources, selected_source, suppress_new=False):
+        statuses = {source["id"]: source.get("status", "") for source in sources}
+        previous = self._source_statuses
+        self._source_statuses = statuses
+        if not self.state.get("sourcePromptEnabled", True):
+            self.source_prompt_timer.stop()
+            self.source_prompt.hide()
+            self._source_prompt_id = None
+            self._pending_source_prompts.clear()
+            return
+        if self._source_prompt_id and (
+            self._source_prompt_id == selected_source
+            or statuses.get(self._source_prompt_id) != "playing"
+        ):
+            self.source_prompt_timer.stop()
+            self.source_prompt.hide()
+            self._source_prompt_id = None
+        self._pending_source_prompts = [
+            source_id for source_id in self._pending_source_prompts
+            if source_id != selected_source and statuses.get(source_id) == "playing"
+        ]
+        if previous is not None and not suppress_new and selected_source:
+            for source in sources:
+                source_id = source["id"]
+                if (source_id != selected_source and source.get("status") == "playing"
+                        and previous.get(source_id) != "playing"
+                        and source_id != self._source_prompt_id
+                        and source_id not in self._pending_source_prompts):
+                    self._pending_source_prompts.append(source_id)
+        self.show_next_source_prompt()
+
+    def show_next_source_prompt(self):
+        while not self._source_prompt_id and self._pending_source_prompts:
+            source_id = self._pending_source_prompts.pop(0)
+            source = next((item for item in self.state.get("sources", [])
+                           if item["id"] == source_id), None)
+            if source is None or source.get("status") != "playing" or source_id == self.state.get("selectedSource"):
+                continue
+            self._source_prompt_id = source_id
+            self.source_prompt_label.setText(f"{source['label']} started playing. Switch source?")
+            self.position_source_prompt()
+            self.source_prompt.show()
+            self.source_prompt.raise_()
+            self.source_prompt_timer.start(
+                int(self.state.get("sourcePromptSeconds", SOURCE_PROMPT_SECONDS_DEFAULT)) * 1000
+            )
+
+    def dismiss_source_prompt(self):
+        self.source_prompt_timer.stop()
+        self.source_prompt.hide()
+        self._source_prompt_id = None
+        self.show_next_source_prompt()
+
+    def accept_source_prompt(self):
+        source_id = self._source_prompt_id
+        if not source_id:
+            return
+        remaining = self.source_prompt_timer.remainingTime()
+        self.source_prompt_timer.stop()
+        if self.change_source(source_id):
+            self._pending_source_prompts.clear()
+            if self._source_prompt_id == source_id:
+                self.dismiss_source_prompt()
+        elif self._source_prompt_id == source_id:
+            self.source_prompt_timer.start(max(1, remaining))
 
     def next_visualizer_mode(self):
         modes = [mode for mode, _label in QT_MODES]
@@ -1353,9 +1716,13 @@ class AmbiBeatQtWindow(QMainWindow):
             previous_track = self.state.get("track") or {}
             previous_art = tuple(previous_track.get(key) for key in ("title", "artist", "album", "art"))
             self.state = state
-            if self.side_panel is not None and self.side_panel.kind == "visual":
-                self.side_panel.sync_visual(state)
+            if self.side_panel is not None:
+                if self.side_panel.kind == "visual":
+                    self.side_panel.sync_fields(state)
+                else:
+                    self.side_panel.sync_settings(state)
             track = state.get("track") or {}
+            self.update_timeline(track)
             self.visualizer.set_state(state)
             self.edge_border.opacity = float(state.get("edgeOpacity", 70)) / 100
             self.edge_border.paused = (
@@ -1399,13 +1766,19 @@ class AmbiBeatQtWindow(QMainWindow):
             source_label = f"Playback source: {selected['label']}" if selected else "Choose playback source"
             self.source_button.setToolTip(source_label)
             self.source_button.setAccessibleName(source_label)
-            if self.prefer_playing_source_on_start and sources:
+            startup_selection = self.prefer_playing_source_on_start and bool(sources)
+            if startup_selection:
                 self.prefer_playing_source_on_start = False
                 active = next((source for source in sources
                                if source["id"].startswith("mpris:")
                                and source.get("status") == "playing"), None)
+                if active and active.get("application"):
+                    active = next((source for source in sources
+                                   if source.get("application") == active["application"]
+                                   and source.get("lastSelected")), active)
                 if active and active["id"] != state.get("selectedSource"):
                     self.change_source(active["id"])
+            self.update_source_prompts(sources, state.get("selectedSource"), startup_selection)
 
             current_art = track.get("art")
             art_key = tuple(track.get(key) for key in ("title", "artist", "album", "art"))
@@ -1421,12 +1794,18 @@ class AmbiBeatQtWindow(QMainWindow):
                 self.edge_border.set_palette([
                     QColor.fromHslF(index / count, 1, .5).name() for index in range(count)
                 ])
+            elif state.get("lightingColorMode") == "christmas":
+                count = int(state.get("edgeColorCount", 8))
+                self.edge_border.set_palette([
+                    CHRISTMAS_COLORS[index % len(CHRISTMAS_COLORS)] for index in range(count)
+                ])
             elif palette:
                 self.edge_border.set_palette(
                     [color.name() for color in palette["edge"]]
                 )
             else:
                 self.edge_border.set_palette(["#1b5bff", "#b46cff", "#6a70ff", "#37ff9a"])
+            self.update_timeline_theme(palette)
             self.edge_border.update_disco(state, elapsed)
             self.edge_border.update()
             self._last_refresh_error = ""
@@ -1437,7 +1816,8 @@ class AmbiBeatQtWindow(QMainWindow):
                 self._last_refresh_error = message
 
     def update_control_borders(self, palette):
-        color = ("#ffffff" if self.state.get("lightingColorMode") == "rainbow"
+        color = ("#ffffff" if self.state.get("lightingColorMode") == "rainbow" else
+                 CHRISTMAS_COLORS[2] if self.state.get("lightingColorMode") == "christmas"
                  else palette["colors"][-1].name() if palette else None)
         if color == self.control_border_color:
             return
@@ -1446,6 +1826,55 @@ class AmbiBeatQtWindow(QMainWindow):
         if color:
             style += f"\nQComboBox, QPushButton, QToolButton {{ border-color: {color}; }}"
         self.setStyleSheet(style)
+        self.position_metadata()
+
+    def update_timeline_theme(self, palette):
+        if self.state.get("lightingColorMode") == "rainbow":
+            colors = self.edge_border.colors + self.edge_border.colors[:1]
+            handle = "#ffffff"
+        elif self.state.get("lightingColorMode") == "christmas":
+            colors = self.edge_border.colors + self.edge_border.colors[:1]
+            handle = CHRISTMAS_COLORS[2]
+        elif palette:
+            colors = palette["colors"]
+            handle = colors[-1].name()
+        else:
+            colors = [QColor("#1b5bff"), QColor("#6a70ff"), QColor("#b46cff")]
+            handle = colors[-1].name()
+        names = tuple(color.name() for color in colors)
+        theme = (names, handle)
+        if theme == self._timeline_theme:
+            return
+        self._timeline_theme = theme
+        self.timeline_slider.setStyleSheet(self.themed_slider_style(theme))
+        if self._volume_slider is not None:
+            self._volume_slider.setStyleSheet(self.themed_slider_style(theme, vertical=True))
+
+    @staticmethod
+    def themed_slider_style(theme, vertical=False):
+        names, handle = theme
+        stops = ", ".join(f"stop: {index / (len(names) - 1):.4f} {color}"
+                          for index, color in enumerate(names))
+        groove = QColor(names[0]).darker(250).name()
+        if vertical:
+            return f"""
+            QSlider::groove:vertical {{ width: 6px; background: {groove}; border-radius: 3px; }}
+            QSlider::add-page:vertical {{
+                background: qlineargradient(x1:0, y1:1, x2:0, y2:0, {stops}); border-radius: 3px;
+            }}
+            QSlider::handle:vertical {{
+                height: 12px; margin: 0 -4px; background: {handle}; border-radius: 6px;
+            }}
+            """
+        return f"""
+            QSlider::groove:horizontal {{ height: 4px; background: {groove}; border-radius: 2px; }}
+            QSlider::sub-page:horizontal {{
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, {stops}); border-radius: 2px;
+            }}
+            QSlider::handle:horizontal {{
+                width: 12px; margin: -4px 0; background: {handle}; border-radius: 6px;
+            }}
+        """
 
     def load_art(self):
         art = (self.state.get("track") or {}).get("art", "")
@@ -1464,23 +1893,75 @@ class AmbiBeatQtWindow(QMainWindow):
         except (dbus.DBusException, OSError, RuntimeError) as error:
             QMessageBox.warning(self, "Playback", f"Playback control failed: {error}")
 
+    def update_timeline(self, track):
+        duration, position = track.get("duration"), track.get("position")
+        available = isinstance(duration, int) and duration > 0 and isinstance(position, int)
+        self.timeline_slider.setEnabled(available and bool(track.get("canSeek")))
+        if self.timeline_slider.isSliderDown():
+            return
+        with QSignalBlocker(self.timeline_slider):
+            maximum = min((duration + 999) // 1000, 2_147_483_647) if available else 1
+            self.timeline_slider.setMaximum(maximum)
+            self.timeline_slider.setSingleStep(max(1, maximum * 5_000_000 // duration) if available else 1)
+            self.timeline_slider.setPageStep(max(1, maximum * 30_000_000 // duration) if available else 1)
+            self.timeline_slider.setValue(min(maximum, max(0, position * maximum // duration)) if available else 0)
+        self.timeline_elapsed.setText(format_track_time(position) if available else "--:--")
+        self.timeline_remaining.setText(format_track_time(duration) if available else "--:--")
+
+    def start_timeline_drag(self):
+        track = self.state.get("track") or {}
+        self._timeline_drag = (self.state.get("selectedSource"), track.get("trackId"), track.get("duration"))
+        self.controls_timer.stop()
+
+    def finish_timeline_drag(self):
+        drag = self._timeline_drag
+        self._timeline_drag = None
+        if drag:
+            self.seek_timeline(*drag)
+        self.show_controls()
+
+    def timeline_value_changed(self, value):
+        if self.timeline_slider.isSliderDown():
+            if self._timeline_drag and self._timeline_drag[2] is not None:
+                self.timeline_elapsed.setText(format_track_time(
+                    self._timeline_drag[2] * value // self.timeline_slider.maximum()
+                ))
+            return
+        track = self.state.get("track") or {}
+        self.seek_timeline(self.state.get("selectedSource"), track.get("trackId"), track.get("duration"))
+
+    def seek_timeline(self, source_id, track_id, duration):
+        try:
+            if not isinstance(duration, int) or duration <= 0 or not source_id or not track_id:
+                raise ValueError("Track is no longer available for seeking")
+            position = duration * self.timeline_slider.value() // self.timeline_slider.maximum()
+            self.backend.seek_track(source_id, track_id, position)
+        except (dbus.DBusException, OSError, ValueError, RuntimeError) as error:
+            QMessageBox.warning(self, "Playback", f"Track position could not be changed: {error}")
+            self.update_timeline(self.state.get("track") or {})
+
     def change_system_volume(self, value):
         try:
             self.panel_request("system-volume", value)
         except (OSError, ValueError, RuntimeError) as error:
             QMessageBox.warning(self, "System volume", f"Volume could not be changed: {error}")
+            return False
+        self.state = {**self.state, "systemVolume": value}
+        return True
 
     def change_source(self, source_id):
         if source_id == self.state.get("selectedSource"):
-            return
+            return True
         try:
             success, warning = self.backend.set_source(source_id)
             if not success:
                 raise ValueError(warning or "Source is no longer available")
             if warning:
                 QMessageBox.warning(self, "Playback source", warning)
+            return True
         except (dbus.DBusException, OSError, ValueError, RuntimeError) as error:
             QMessageBox.warning(self, "Playback source", f"Source could not be changed: {error}")
+            return False
 
     def open_settings(self):
         self.open_side_panel("settings")
@@ -1495,6 +1976,9 @@ class AmbiBeatQtWindow(QMainWindow):
             self.visualizer.set_state(self.state)
         elif name == "show-photosensitivity-warning":
             self.state = {**self.state, "showPhotosensitivityWarning": value}
+        elif name == "source-prompt-enabled":
+            self.state = {**self.state, "sourcePromptEnabled": value}
+            self.update_source_prompts(self.state.get("sources") or [], self.state.get("selectedSource"))
         if warning:
             QMessageBox.warning(self, "Playback source", warning)
 
@@ -1539,6 +2023,8 @@ class AmbiBeatQtWindow(QMainWindow):
         panel.setGeometry(start_x, 0, width, central.height())
         panel.show()
         panel.raise_()
+        if self._source_prompt_id:
+            self.source_prompt.raise_()
         self.controls_timer.stop()
         self.cursor_timer.stop()
         self.setCursor(Qt.CursorShape.ArrowCursor)
@@ -1553,18 +2039,6 @@ class AmbiBeatQtWindow(QMainWindow):
         panel = self.side_panel
         if panel is None or self.panel_closing:
             return True
-        if panel.kind == "settings" and panel.has_unsaved_settings():
-            choice = QMessageBox.question(
-                self, "Unsaved settings", "Save changes to settings before closing?",
-                QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard
-                | QMessageBox.StandardButton.Cancel,
-                QMessageBox.StandardButton.Cancel,
-            )
-            if choice == QMessageBox.StandardButton.Save:
-                if not panel.apply_settings():
-                    return False
-            elif choice != QMessageBox.StandardButton.Discard:
-                return False
         self.panel_closing = True
         self.panel_animation.stop()
         end_x = -panel.width() if panel.kind == "visual" else self.centralWidget().width()

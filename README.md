@@ -44,23 +44,29 @@ Launch the standalone Qt visualiser:
 
 Before the visualiser opens, a photosensitivity warning follows the system theme and accessibility settings. Select **Remember my acknowledgement** to save it in that user's settings; otherwise the warning appears again on the next launch. **Show photosensitivity warning on startup** in Settings lets you change this later.
 
-The Qt visualiser includes Bars, Scope, Halo, Time Vortex, and No visualisation. Move the pointer or press a key to reveal the controls. Click the left or right third of the visualiser to open visual effects or settings, respectively; double-click the middle third to cycle visualisations. The visual-effects menu can hide the Scope zero reference line; it is shown by default.
+The Qt visualiser includes Bars, Scope, Halo, Time Vortex, and No visualisation. Move the pointer or press a key to reveal the controls. Click the left or right third of the visualiser to open visual effects or settings, respectively; double-click the middle third to cycle visualisations. Scope and Halo share a line thickness setting (25–300%, with 100% as the default); Scope also offers a zero reference line toggle.
 
-The lower Qt controls, including the source menu and fullscreen button, appear above the track title and artist. When Qt starts, it selects a currently playing computer app if one is available, even if another source was saved; otherwise it keeps the current source.
+The lower Qt controls, including the source menu and fullscreen button, appear above the track title and artist. The artist and album text matches the control border colour and has a dark shadow for contrast. When Qt starts, it selects a currently playing computer app if one is available, even if another source was saved; if that app has multiple instances, it prefers the one last selected in AmbiBeat when still available. Source selectors show app icons when available.
+
+When another playback source starts playing, a card at the top offers to switch to it. Choose **Switch** or **Keep current**; if it expires, the current source remains selected. In Settings, **Show switch to new source message** enables the card and **Source switch prompt duration** sets its duration to 3–60 seconds (10 seconds by default). The duration control is disabled when the message is off. Source status is checked approximately every three seconds.
+
+Percentage and prompt-duration sliders snap to multiples of 10 when dragged. Hold Shift while dragging, or use the arrow keys, for finer adjustments. Sliders for counts and gain retain their normal steps.
+
+A track timeline appears above the controls and follows the selected colour theme. Click or drag it to seek when the selected player reports a duration, position and seek support; otherwise the selector is disabled.
 
 Showing or hiding the controls does not resize or move the visual effects; the controls appear over them.
 
-In Qt, artwork is centred on the screen in every visualisation mode. In Halo, selected artwork fades outward in a circle in response to bass, surrounded by a glowing scope-style outline. The artwork opacity setting still applies; with no artwork, the halo retains its coloured glow.
+In Qt, artwork is centred on the screen in every visualisation mode. In Halo, selected artwork fades outward in a circle in response to bass, surrounded by a glowing scope-style outline that pulses with the bass while following individual frequency bands. The artwork opacity setting still applies; with no artwork, the halo retains its coloured glow.
 
 Qt control borders use a bright colour derived from the selected artwork palette, reverting to their default appearance when no artwork colours are active.
 
-In Qt, the visual-effects button opens a left-side menu; click outside it to close it. Changes apply immediately, and **Reset to defaults** restores the visual settings. The settings menu contains source selection, system volume, per-source boost, and sample rate. Select **Save** to apply changes, or close the menu (including by clicking outside) to choose whether to save or discard unsaved changes. Sliders ignore mouse-wheel input.
+In Qt, the visual-effects button opens a left-side menu; click outside it to close it. Changes in both panels apply immediately. Each panel has **Reset to defaults**; the settings reset restores all source boosts and app settings but leaves the selected source and system volume unchanged. Sliders ignore mouse-wheel input.
 
 The visual-effects menu offers **Show Album Art**, **Show Logo**, and **No artwork**. The choice is saved. Visualisation colours come from the selected album art or logo; **No artwork** uses the default colours and a background that fades from blue in the centre to black at the edges.
 
-The **Lighting** setting selects edge lighting, lights, or none, independently of the visualisation. Lights replaces the border with evenly spaced semicircular lights and ambient glows across the top and sides, using the current edge palette. With swirl off, the lights remain steady; with it on, they react to audio and different colours fade at different rates. **Light count** sets the total number of lights (3–40), and **Light size** sets their radius (40–200%). **Edge colour fade** controls their softness and decay, while the edge opacity and vividness controls also apply.
+The **Lighting** setting selects edge lighting, lights, or none, independently of the visualisation. The effects panel shows the controls relevant to the selected lighting mode. Lights are evenly spaced across the top and sides, using the current edge palette. **Light style** offers the original semicircular glow, fairy lights, classic bulbs and stars; the shaped lights have a gently curved wire that can be green, use the lighting colours, or be hidden with **Wireless**. With swirl off, the lights remain steady; with it on, they react to audio and different colours fade at different rates. During playback, quiet lights remain dimly lit; they fade out when playback pauses. **Light count** sets the total number of lights (3–40), and **Light size** sets their size (40–200%). **Lighting fade** controls their softness and decay, while the lighting opacity and vividness controls also apply.
 
-**Lighting colours** selects artwork-derived colours or rainbow colours for the border and lights. Rainbow uses the default blue-to-black background and white Qt control borders; visualisation colours still follow the selected artwork.
+**Lighting colours** selects artwork-derived, rainbow or Christmas colours for the border, lights and visualisations. Rainbow uses the default blue-to-black background and white Qt control borders; Christmas uses red, green and gold lighting with a festive background and matching controls.
 
 **Border depth** controls how far edge lighting extends into the screen (25–200%); 100% is the standard depth. It does not change light size.
 

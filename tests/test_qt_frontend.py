@@ -10,13 +10,14 @@ pytest.importorskip("PySide6")
 
 from PySide6.QtCore import QAbstractAnimation, QBuffer, QEvent, QIODevice, QPoint, QPointF, QRectF, Qt, QTimer
 from PySide6.QtGui import (
-    QColor, QFont, QImage, QMouseEvent, QOpenGLContext, QPaintEngine, QPainter, QPalette, QPixmap, QWheelEvent,
+    QColor, QFont, QImage, QMouseEvent, QOpenGLContext, QPaintEngine, QPainter, QPalette, QPixmap, QRegion,
+    QWheelEvent,
 )
 from PySide6.QtOpenGL import QOpenGLFramebufferObject
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QStyle, QStyleOptionButton, QStyleOptionSlider, QWidget
 
-from ambibeat import qt_frontend
+from ambibeat import qt_frontend, qt_panels
 from ambibeat.qt_frontend import AmbiBeatQtWindow
 from ambibeat.qt_panels import SidePanel
 
@@ -213,11 +214,206 @@ def test_lower_controls_stay_above_track_text(window, size):
         assert position.y() + button.height() <= title_rect.top()
     assert title_rect.bottom() < artist_rect.top()
     assert artist_rect.bottom() < central.height()
+    for label in (window.track_title, window.track_artist):
+        assert label.height() >= label.fontMetrics().height() + 4
+    shadow = window.track_artist.graphicsEffect().boundingRectFor(QRectF(window.track_artist.rect()))
+    assert artist_rect.top() + shadow.bottom() < central.height()
 
     window.hide_controls()
     QApplication.processEvents()
     assert window.track_title.geometry() == title_rect
     assert window.track_artist.geometry() == artist_rect
+
+
+@pytest.mark.parametrize("size", [(640, 420), (1100, 720), (1920, 1080)])
+@pytest.mark.parametrize("label_name", ["track_title", "track_artist"])
+def test_track_text_is_not_clipped_vertically(window, size, label_name):
+    window.resize(*size)
+    window.show_controls()
+    QApplication.processEvents()
+    label = getattr(window, label_name)
+    label.setText("gypj Qy")
+    effect = label.graphicsEffect()
+    if effect:
+        effect.setEnabled(False)
+
+    def ink():
+        image = QImage(label.size(), QImage.Format.Format_RGBA8888_Premultiplied)
+        image.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(image)
+        label.render(painter, QPoint(), QRegion(), QWidget.RenderFlag.DrawChildren)
+        painter.end()
+        return sum(bytes(image.bits())[3::4])
+
+    original_size = label.size()
+    try:
+        actual = ink()
+        label.resize(label.width(), label.height() + 40)
+        assert actual == ink()
+    finally:
+        label.resize(original_size)
+        if effect:
+            effect.setEnabled(True)
+
+
+def test_timeline_displays_progress_and_seeks_by_click_and_keyboard(window):
+    source = "mpris:org.mpris.MediaPlayer2.player"
+    state = {
+        "selectedSource": source,
+        "track": {"status": "paused", "trackId": "/track/1", "canSeek": True,
+                  "position": 30_000_000, "duration": 120_000_000},
+    }
+    window.backend.get_state.return_value = state
+    window.refresh_state()
+    slider = window.timeline_slider
+    assert slider.isEnabled()
+    assert slider.value() == 30_000
+    assert window.timeline_elapsed.text() == "0:30"
+    assert window.timeline_remaining.text() == "2:00"
+    assert slider.mapTo(window.centralWidget(), QPoint(0, 0)).y() < window.play_button.mapTo(
+        window.centralWidget(), QPoint(0, 0)).y()
+    QTest.mouseClick(slider, Qt.MouseButton.LeftButton, pos=QPoint(slider.width() * 3 // 4, slider.height() // 2))
+    args = window.backend.seek_track.call_args.args
+    assert args[:2] == (source, "/track/1")
+    assert args[2] == pytest.approx(90_000_000, abs=2_000_000)
+    window.backend.seek_track.reset_mock()
+    slider.setFocus()
+    QTest.keyClick(slider, Qt.Key.Key_Left)
+    window.backend.seek_track.assert_called_once()
+
+
+def test_timeline_disables_without_seek_support_and_rejects_stale_drag(window, monkeypatch):
+    source = "mpris:org.mpris.MediaPlayer2.player"
+    track = {"status": "playing", "trackId": "/track/1", "canSeek": True,
+             "position": 10_000_000, "duration": 60_000_000}
+    window.backend.get_state.return_value = {"selectedSource": source, "track": track}
+    window.refresh_state()
+    slider = window.timeline_slider
+    QTest.mousePress(slider, Qt.MouseButton.LeftButton, pos=slider.rect().center())
+    window.hide_controls()
+    assert window.controls_effect.opacity() == 1
+    window.backend.get_state.return_value = {"selectedSource": source, "track": {**track, "trackId": "/track/2"}}
+    window.refresh_state()
+    window.backend.seek_track.side_effect = ValueError("Track changed")
+    warnings = []
+    monkeypatch.setattr(qt_frontend.QMessageBox, "warning", lambda *args: warnings.append(args[-1]))
+    QTest.mouseRelease(slider, Qt.MouseButton.LeftButton, pos=slider.rect().center())
+    assert window.backend.seek_track.call_args.args[:2] == (source, "/track/1")
+    assert warnings and "Track changed" in warnings[0]
+    window.backend.get_state.return_value = {"track": {}}
+    window.refresh_state()
+    assert not slider.isEnabled()
+    assert window.timeline_elapsed.text() == "--:--"
+
+
+def test_timeline_waits_for_drag_release_and_preserves_preview(window):
+    source = "mpris:org.mpris.MediaPlayer2.player"
+    track = {"status": "playing", "trackId": "/track/1", "canSeek": True,
+             "position": 10_000_000, "duration": 60_000_000}
+    window.backend.get_state.return_value = {"selectedSource": source, "track": track}
+    window.refresh_state()
+    slider = window.timeline_slider
+    point = QPoint(slider.width() * 3 // 4, slider.height() // 2)
+    QTest.mousePress(slider, Qt.MouseButton.LeftButton, pos=point)
+    preview = slider.value()
+    assert preview > 40_000
+    window.backend.seek_track.assert_not_called()
+    window.refresh_state()
+    assert slider.value() == preview
+    QTest.mouseRelease(slider, Qt.MouseButton.LeftButton, pos=point)
+    window.backend.seek_track.assert_called_once()
+
+
+def test_timeline_clicks_do_not_activate_background_controls(window, monkeypatch):
+    source = "mpris:org.mpris.MediaPlayer2.player"
+    track = {"status": "paused", "trackId": "/track/1", "canSeek": True,
+             "position": 10_000_000, "duration": 60_000_000}
+    window.backend.get_state.return_value = {"selectedSource": source, "track": track}
+    window.refresh_state()
+    calls = []
+    monkeypatch.setattr(window, "open_mode_menu", lambda: calls.append("effects"))
+    monkeypatch.setattr(window, "open_settings", lambda: calls.append("settings"))
+    monkeypatch.setattr(window, "next_visualizer_mode", lambda: calls.append("next effect"))
+    slider = window.timeline_slider
+    for x in (4, slider.width() - 4):
+        QTest.mouseClick(slider, Qt.MouseButton.LeftButton, pos=QPoint(x, slider.height() // 2))
+    QTest.mouseDClick(slider, Qt.MouseButton.LeftButton, pos=slider.rect().center())
+    QTest.mouseClick(window.timeline_elapsed, Qt.MouseButton.LeftButton)
+    window.backend.get_state.return_value = {"track": {}}
+    window.refresh_state()
+    QTest.mouseClick(slider, Qt.MouseButton.LeftButton, pos=slider.rect().center())
+    assert calls == []
+
+
+def test_timeline_follows_artwork_rainbow_and_default_colours(window):
+    track = {"status": "paused", "trackId": "/track/1", "canSeek": True,
+             "position": 30_000_000, "duration": 60_000_000}
+    state = {"track": track, "artworkMode": "album"}
+    window.backend.get_state.return_value = state
+    visualizer = window.visualizer
+
+    def timeline_pixel():
+        image = window.timeline_slider.grab().toImage()
+        return image.pixelColor(image.width() // 4, image.height() // 2)
+
+    colors = []
+    for color in ("red", "blue"):
+        pixmap = QPixmap(32, 32)
+        pixmap.fill(QColor(color))
+        visualizer.track_palette = visualizer.sample_palette(pixmap)
+        window.refresh_state()
+        colors.append(timeline_pixel())
+    assert colors[0] != colors[1]
+    state["lightingColorMode"] = "rainbow"
+    state["edgeColorCount"] = 3
+    window.refresh_state()
+    style = window.timeline_slider.styleSheet()
+    assert all(color in style for color in ("#ff0000", "#00ff00", "#0000ff"))
+    assert timeline_pixel() not in colors
+    state["edgeColorCount"] = 4
+    window.refresh_state()
+    assert window.timeline_slider.styleSheet() != style
+    state["lightingColorMode"] = "artwork"
+    state["artworkMode"] = "none"
+    window.refresh_state()
+    assert "#1b5bff" in window.timeline_slider.styleSheet()
+    assert timeline_pixel() != colors[0]
+
+
+def test_christmas_theme_changes_lighting_background_and_controls(window):
+    visualizer = window.visualizer
+    artwork = {
+        "base": QColor("blue"), "background": [QColor("blue")],
+        "colors": [QColor("blue")] * 3, "edge": [QColor("blue")],
+    }
+    visualizer.track_palette = artwork
+    state = {"track": {"status": "paused"}, "artworkMode": "album",
+             "lightingColorMode": "christmas", "edgeColorCount": 3}
+    window.backend.get_state.return_value = state
+    window.refresh_state()
+    assert [color.name() for color in window.edge_border.colors] == list(qt_frontend.CHRISTMAS_COLORS)
+    assert window.control_border_color == qt_frontend.CHRISTMAS_COLORS[2]
+    assert all(color in window.timeline_slider.styleSheet() for color in qt_frontend.CHRISTMAS_COLORS)
+    assert visualizer.active_palette() is artwork
+    assert [color.name() for color in visualizer.effect_palette()["colors"]] == list(
+        qt_frontend.CHRISTMAS_COLORS)
+
+    def background():
+        image = QImage(300, 200, QImage.Format.Format_ARGB32_Premultiplied)
+        painter = QPainter(image)
+        visualizer.paint_background(painter, 300, 200)
+        painter.end()
+        return image.pixelColor(150, 84)
+
+    festive = background()
+    assert festive.green() > festive.blue()
+    window.backend.get_state.return_value = {**state, "lightingColorMode": "artwork"}
+    window.refresh_state()
+    assert background() != festive
+    assert window.control_border_color == "#0000ff"
+    window.backend.get_state.return_value = state
+    window.refresh_state()
+    assert background() == festive
 
 
 def test_fullscreen_button_in_lower_controls_toggles_fullscreen(window):
@@ -431,16 +627,22 @@ def test_control_borders_follow_artwork_palette_and_restore_default(window, monk
     window.refresh_state()
     red = window.visualizer.track_palette["colors"][-1].name()
     assert border_colors() == [red] * 4
+    assert window.track_artist.palette().color(QPalette.ColorRole.WindowText).name() == red
 
     state = {"track": {**track, "title": "Blue", "art": blue_art.as_uri()}, "artworkMode": "album"}
     window.refresh_state()
     blue = window.visualizer.track_palette["colors"][-1].name()
     assert blue != red
     assert border_colors() == [blue] * 4
+    assert window.track_artist.palette().color(QPalette.ColorRole.WindowText).name() == blue
+    window.resize(900, 600)
+    window.hide_controls()
+    assert window.track_artist.palette().color(QPalette.ColorRole.WindowText).name() == blue
 
     state = {**state, "artworkMode": "none"}
     window.refresh_state()
     assert border_colors() == default_colors
+    assert window.track_artist.palette().color(QPalette.ColorRole.WindowText).alpha() == 102
 
     logo = QPixmap(32, 32)
     logo.fill(QColor("lime"))
@@ -453,6 +655,7 @@ def test_control_borders_follow_artwork_palette_and_restore_default(window, monk
     state = {**state, "lightingColorMode": "rainbow", "edgeColorCount": 3}
     window.refresh_state()
     assert border_colors() == ["#ffffff"] * 4
+    assert window.track_artist.palette().color(QPalette.ColorRole.WindowText).name() == "#ffffff"
     assert [color.name() for color in window.edge_border.colors] == [
         "#ff0000", "#00ff00", "#0000ff",
     ]
@@ -466,6 +669,20 @@ def test_control_borders_follow_artwork_palette_and_restore_default(window, monk
              "artworkMode": "album"}
     window.refresh_state()
     assert border_colors() == default_colors
+
+
+def test_artist_text_has_visible_shadow(window):
+    window.track_artist.setText("Artist - Album")
+    effect = window.track_artist.graphicsEffect()
+    assert isinstance(effect, qt_frontend.QGraphicsDropShadowEffect)
+    effect.setEnabled(False)
+    without_shadow = window.track_artist.grab().toImage()
+    effect.setEnabled(True)
+    with_shadow = window.track_artist.grab().toImage()
+    def on_white(color):
+        return (color.lightness() * color.alpha() + 255 * (255 - color.alpha())) // 255
+    assert any(on_white(without_shadow.pixelColor(x, y)) - on_white(with_shadow.pixelColor(x, y)) >= 20
+               for y in range(with_shadow.height()) for x in range(with_shadow.width()))
 
 
 @pytest.mark.parametrize("art_color", ["red", "blue", "black", "white"])
@@ -589,6 +806,36 @@ def test_disco_lights_are_steady_when_swirl_is_off(window):
     assert border.disco_levels == []
 
 
+def test_animated_lights_remain_visible_in_quiet_bands_and_fade_when_paused(window):
+    border = window.edge_border
+    border.resize(780, 520)
+    border.opacity = 1
+    border.set_palette(["#ff0000", "#00ff00", "#0000ff"])
+    state = {"lightingMode": "disco", "discoLightStyle": "bulb", "discoLightCount": 3,
+             "discoWireColor": "none", "edgeSwirl": True,
+             "track": {"status": "playing"}, "bars": [1, 0, 0]}
+    border.update_disco(state, .05)
+    assert border.disco_levels == pytest.approx([1, .3, .3])
+
+    def render():
+        image = QImage(780, 520, QImage.Format.Format_ARGB32_Premultiplied)
+        image.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(image)
+        border.paint_border(painter, state)
+        painter.end()
+        return image
+
+    quiet = render()
+    assert quiet.pixelColor(30, 260).green() > 0
+    assert quiet.pixelColor(750, 260).blue() > 0
+    border.update_disco({**state, "bars": [1, 1, 1]}, .05)
+    loud = render()
+    assert loud.pixelColor(30, 260).alpha() > quiet.pixelColor(30, 260).alpha()
+    for _ in range(100):
+        border.update_disco({**state, "track": {"status": "paused"}}, .25)
+    assert max(border.disco_levels) < .001
+
+
 def test_disco_swirl_toggle_is_available_in_settings(window):
     dialog = SidePanel({"lightingMode": "disco"}, "visual", qt_frontend.QT_MODES,
                        lambda path: None, window)
@@ -706,6 +953,138 @@ def test_border_depth_does_not_change_disco_lights(window):
     assert render(25) == render(200)
 
 
+def test_festive_light_styles_render_on_all_sides_and_honor_wire_colour(window):
+    border = window.edge_border
+    border.resize(780, 520)
+    border.opacity = 1
+    border.set_palette(["#ff0000"])
+    state = {"lightingMode": "disco", "discoLightCount": 3, "edgeSwirl": False}
+    border.update_disco(state, .05)
+
+    def render(style, wire="green"):
+        image = QImage(780, 520, QImage.Format.Format_ARGB32_Premultiplied)
+        image.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(image)
+        border.paint_border(painter, {**state, "discoLightStyle": style, "discoWireColor": wire})
+        painter.end()
+        return image
+
+    images = [render(style) for style in ("fairy", "bulb", "star")]
+    assert len({bytes(image.bits()) for image in images}) == 3
+    for image in images:
+        assert image.pixelColor(390, 16).red() > 0
+        assert image.pixelColor(16, 260).red() > 0
+        assert image.pixelColor(763, 260).red() > 0
+        assert image.pixelColor(390, 519).alpha() == 0
+    green = images[0].pixelColor(195, 10)
+    themed = render("fairy", "theme").pixelColor(195, 10)
+    assert green.green() > green.red()
+    assert themed.red() > themed.green()
+    border.opacity = 0
+    assert render("bulb").pixelColor(195, 10).alpha() == 0
+    assert render("bulb").pixelColor(390, 16).alpha() == 0
+
+
+def test_festive_light_wire_control_tracks_style_and_sync(window):
+    actions = []
+    panel = SidePanel({}, "visual", qt_frontend.QT_MODES,
+                      lambda name, value: actions.append((name, value)), window)
+    assert not panel.disco_wire_color.isEnabled()
+    assert panel.light_wire_settings.isHidden()
+    panel.disco_style.setCurrentIndex(panel.disco_style.findData("fairy"))
+    assert panel.disco_wire_color.isEnabled()
+    assert not panel.light_wire_settings.isHidden()
+    panel.disco_wire_color.setCurrentIndex(panel.disco_wire_color.findData("theme"))
+    assert actions == [("disco-light-style", "fairy"), ("disco-wire-color", "theme")]
+    panel.disco_wire_color.setCurrentIndex(panel.disco_wire_color.findData("none"))
+    assert actions[-1] == ("disco-wire-color", "none")
+    panel.sync_fields({"discoLightStyle": "glow"})
+    assert not panel.disco_wire_color.isEnabled()
+    assert panel.light_wire_settings.isHidden()
+    assert len(actions) == 3
+    panel.reset_button.click()
+    assert panel.disco_wire_color.currentData() == "green"
+
+
+def test_visual_controls_follow_lighting_mode_and_keep_hidden_values(window):
+    actions = []
+    panel = SidePanel({}, "visual", qt_frontend.QT_MODES,
+                      lambda name, value: actions.append((name, value)), window)
+
+    def visibility():
+        return tuple(not widget.isHidden() for widget in (
+            panel.lighting_count_settings, panel.lighting_appearance,
+            panel.border_settings, panel.light_settings, panel.edge_swirl))
+
+    assert visibility() == (True, True, True, False, True)
+    panel.disco_style.setCurrentIndex(panel.disco_style.findData("star"))
+    panel.lighting_mode.setCurrentIndex(panel.lighting_mode.findData("disco"))
+    assert visibility() == (True, True, False, True, True)
+    panel.sync_fields({"lightingMode": "none"})
+    assert visibility() == (False, False, False, False, False)
+    assert panel.disco_style.currentData() == "star"
+    panel.lighting_color_mode.setCurrentIndex(panel.lighting_color_mode.findData("rainbow"))
+    assert visibility() == (True, False, False, False, False)
+    panel.reset_button.click()
+    assert visibility() == (True, True, True, False, True)
+    assert panel.disco_style.currentData() == "glow"
+
+
+def test_festive_wire_bends_between_lights_and_wireless_hides_it(window):
+    border = window.edge_border
+    border.resize(780, 520)
+    border.opacity = 1
+    border.set_palette(["#ff0000"])
+    state = {"lightingMode": "disco", "discoLightStyle": "bulb", "discoLightCount": 3,
+             "edgeSwirl": True, "track": {"status": "paused"}, "bars": [0]}
+    border.update_disco(state, .05)
+
+    def render(wire):
+        image = QImage(780, 520, QImage.Format.Format_ARGB32_Premultiplied)
+        image.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(image)
+        border.paint_border(painter, {**state, "discoWireColor": wire})
+        painter.end()
+        return image
+
+    wired = render("green")
+    wireless = render("none")
+    assert wired.pixelColor(195, 10).alpha() > 0
+    assert wired.pixelColor(195, 2).alpha() == 0
+    assert wireless.pixelColor(195, 10).alpha() == 0
+    for x in (10, 769):
+        assert wired.pixelColor(x, 130).alpha() > 0
+        assert wireless.pixelColor(x, 130).alpha() == 0
+    assert wireless.pixelColor(390, 16).alpha() == 0
+    border.update_disco({**state, "track": {"status": "playing"}, "bars": [1]}, .05)
+    assert render("none").pixelColor(390, 30).alpha() > 0
+
+
+@pytest.mark.parametrize("style", ["fairy", "bulb", "star"])
+def test_festive_lights_react_to_audio_and_follow_size(window, style):
+    border = window.edge_border
+    border.resize(780, 520)
+    border.set_palette(["#ff0000"])
+    state = {"lightingMode": "disco", "discoLightStyle": style, "discoLightCount": 3,
+             "edgeSwirl": True, "track": {"status": "paused"}, "bars": [0]}
+
+    def render(size=100):
+        image = QImage(780, 520, QImage.Format.Format_ARGB32_Premultiplied)
+        image.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(image)
+        border.paint_border(painter, {**state, "discoLightSize": size})
+        painter.end()
+        return image
+
+    border.update_disco(state, .05)
+    assert render().pixelColor(390, 30).alpha() == 0
+    border.update_disco({**state, "track": {"status": "playing"}, "bars": [1]}, .05)
+    normal = render()
+    large = render(200)
+    assert normal.pixelColor(390, 30).alpha() > 0
+    assert large.pixelColor(390, 65).alpha() > normal.pixelColor(390, 65).alpha()
+
+
 def test_vortex_renders_distinct_from_empty_scene(window, monkeypatch):
     window.visualizer.fallback_pixmap = None
     window.visualizer.art_pixmap = None
@@ -728,6 +1107,42 @@ def test_vortex_renders_distinct_from_empty_scene(window, monkeypatch):
                for y in range(80, 450, 20))
 
 
+@pytest.mark.parametrize("mode", [0, 1, 2, 4])
+def test_visualizations_follow_lighting_theme_and_restore_artwork(window, monkeypatch, mode):
+    visualizer = window.visualizer
+    visualizer.fallback_pixmap = None
+    visualizer.art_pixmap = None
+    visualizer.track_palette = {
+        "base": QColor("black"), "background": [],
+        "colors": [QColor("blue")] * 3, "edge": [QColor("blue")],
+    }
+    monkeypatch.setattr(visualizer, "paint_background",
+                        lambda painter, width, height: painter.fillRect(0, 0, width, height,
+                                                                       QColor("black")))
+    now = qt_frontend.time.monotonic()
+    monkeypatch.setattr(qt_frontend.time, "monotonic", lambda: now)
+    state = {"track": {"status": "playing"}, "visualizerMode": mode,
+             "artworkMode": "album", "edgeColorCount": 3,
+             "bars": [.7] * 24, "wave": [math.sin(i / 5) * .5 for i in range(64)]}
+
+    def render(theme):
+        visualizer.set_state({**state, "lightingColorMode": theme})
+        visualizer.last_frame = now
+        visualizer.vortex_beat = 0
+        image = QImage(visualizer.width(), visualizer.height(), QImage.Format.Format_ARGB32_Premultiplied)
+        image.fill(Qt.GlobalColor.transparent)
+        visualizer.paint_scene(QPainter(image))
+        return image
+
+    artwork = render("artwork")
+    rainbow = render("rainbow")
+    christmas = render("christmas")
+    assert artwork != rainbow
+    assert artwork != christmas
+    assert rainbow != christmas
+    assert render("artwork") == artwork
+
+
 def test_halo_renders_audio_and_selected_palette(window):
     visualizer = window.visualizer
     visualizer.fallback_pixmap = None
@@ -738,7 +1153,7 @@ def test_halo_renders_audio_and_selected_palette(window):
         "colors": [QColor("red")] * 3, "edge": [QColor("red")],
     }
     state = {"track": {"status": "paused"}, "visualizerMode": 2,
-             "artworkMode": "album", "lightingColorMode": "rainbow"}
+             "artworkMode": "album", "lightingColorMode": "artwork"}
     def image():
         if isinstance(visualizer, qt_frontend.GPUVisualizerWidget):
             return visualizer.grabFramebuffer()
@@ -759,6 +1174,34 @@ def test_halo_renders_audio_and_selected_palette(window):
     assert not visualizer.frame_timer.isActive()
     default = image()
     assert default.pixelColor(x, y).blue() > default.pixelColor(x, y).red()
+
+
+def test_halo_bass_pulses_quiet_sections_without_exceeding_layout(window, monkeypatch):
+    visualizer = window.visualizer
+    visualizer.fallback_pixmap = None
+    visualizer.art_pixmap = None
+    paths = []
+    monkeypatch.setattr(qt_frontend, "paint_scope_path",
+                        lambda painter, path, gradient, line_width: paths.append(path))
+    now = qt_frontend.time.monotonic()
+    monkeypatch.setattr(qt_frontend.time, "monotonic", lambda: now)
+    state = {"track": {"status": "playing"}, "visualizerMode": 2, "artworkMode": "none"}
+
+    def radii(bars):
+        visualizer.set_state({**state, "bars": bars})
+        visualizer.last_frame = now - .1
+        image = QImage(visualizer.width(), visualizer.height(), QImage.Format.Format_ARGB32_Premultiplied)
+        visualizer.paint_scene(QPainter(image))
+        path = paths[-1]
+        cx, cy = visualizer.width() / 2, visualizer.height() / 2
+        return [math.hypot(path.elementAt(i).x - cx, path.elementAt(i).y - cy)
+                for i in range(len(bars))]
+
+    quiet = radii([.2] * 3 + [.1] * 21)
+    loud = radii([.8] * 3 + [.1] * 21)
+    assert all(after > before for before, after in zip(quiet, loud))
+    assert loud[6] - quiet[6] == pytest.approx(visualizer.halo_layout()[1] * .04 * .6)
+    assert max(radii([1] * 24)) == pytest.approx(visualizer.halo_layout()[1] * .45)
 
 
 @pytest.mark.parametrize("artwork_mode", ["album", "logo"])
@@ -893,9 +1336,9 @@ def test_halo_scales_to_available_space_and_uses_scope_style(window, monkeypatch
     strokes = []
     paint_scope_path = qt_frontend.paint_scope_path
 
-    def record_stroke(painter, path, gradient):
+    def record_stroke(painter, path, gradient, line_width=3.5):
         strokes.append((path.boundingRect(), gradient.stops()))
-        paint_scope_path(painter, path, gradient)
+        paint_scope_path(painter, path, gradient, line_width)
 
     monkeypatch.setattr(qt_frontend, "paint_scope_path", record_stroke)
     state = {"track": {"status": "playing"}, "visualizerMode": 2,
@@ -1049,6 +1492,61 @@ def test_scope_zero_line_visual_setting_applies_and_resets(window, monkeypatch):
     assert actions == [("scope-zero-line", False)]
     panel.reset_button.click()
     assert actions[-1] == ("scope-zero-line", True)
+
+
+def test_line_settings_follow_selected_mode_and_sync(window, monkeypatch):
+    actions = []
+    monkeypatch.setattr(window.backend, "update_setting",
+                        lambda name, value, source_id=None: actions.append((name, value)))
+    window.open_mode_menu()
+    panel = window.side_panel
+    assert panel.line_settings.isHidden()
+    panel.mode.setCurrentIndex(panel.mode.findData(1))
+    assert not panel.line_settings.isHidden()
+    assert not panel.scope_zero_line.isHidden()
+    panel.scope_width.setValue(200)
+    assert panel.scope_width_value.text() == "200%"
+    assert actions[-1] == ("scope-line-width", 200)
+    panel.sync_fields({"visualizerMode": 2})
+    assert not panel.line_settings.isHidden()
+    assert panel.scope_zero_line.isHidden()
+    panel.sync_fields({"visualizerMode": 1})
+    assert not panel.line_settings.isHidden()
+    assert not panel.scope_zero_line.isHidden()
+    panel.reset_button.click()
+    assert panel.line_settings.isHidden()
+    assert panel.scope_width.value() == 100
+    assert actions[-1] == ("scope-line-width", 100)
+
+
+@pytest.mark.parametrize("percent,expected", [(25, .875), (100, 3.5), (300, 10.5)])
+def test_line_thickness_changes_scope_and_halo_rendered_pens(window, monkeypatch, percent, expected):
+    visualizer = window.visualizer
+    visualizer.fallback_pixmap = None
+    window.edge_border.opacity = 0
+    strokes = []
+    original = QPainter.drawPath
+
+    def record(painter, path):
+        strokes.append(painter.pen().widthF())
+        original(painter, path)
+
+    monkeypatch.setattr(QPainter, "drawPath", record)
+    state = {"track": {"status": "playing"}, "visualizerMode": 1, "artworkMode": "none",
+             "scopeZeroLine": False, "scopeLineWidth": percent, "wave": [.5] * 64}
+    visualizer.set_state(state)
+    if isinstance(visualizer, qt_frontend.GPUVisualizerWidget):
+        visualizer.grabFramebuffer()
+    else:
+        visualizer.grab()
+    assert strokes[-4:] == pytest.approx([expected * 2, expected * 4, expected * 18 / 7, expected])
+    strokes.clear()
+    visualizer.set_state({**state, "visualizerMode": 2, "bars": [.5] * 24})
+    if isinstance(visualizer, qt_frontend.GPUVisualizerWidget):
+        visualizer.grabFramebuffer()
+    else:
+        visualizer.grab()
+    assert strokes[-4:] == pytest.approx([expected * 2, expected * 4, expected * 18 / 7, expected])
 
 
 def test_scope_interpolates_between_audio_updates_and_stops_when_paused(window):
@@ -1271,6 +1769,39 @@ def test_source_menu_shows_selected_source_and_switches(window, monkeypatch):
     assert window.source_button.parentWidget() is window.settings_button.parentWidget()
 
 
+def test_source_icons_appear_in_menu_and_settings_and_update(window, monkeypatch, tmp_path):
+    icons = {}
+    for entry, color in (("app-one", "red"), ("app-two", "blue")):
+        image = QPixmap(16, 16)
+        image.fill(QColor(color))
+        icon_path = tmp_path / f"{entry}.png"
+        assert image.save(str(icon_path))
+        desktop_path = tmp_path / f"{entry}.desktop"
+        desktop_path.write_text(f"[Desktop Entry]\nIcon={icon_path}\n", encoding="utf-8")
+        icons[entry + ".desktop"] = str(desktop_path)
+    monkeypatch.setattr(qt_panels.QStandardPaths, "locate",
+                        lambda _location, name: icons.get(name, ""))
+    source = {"id": "mpris:org.mpris.MediaPlayer2.test", "label": "Player",
+              "identity": "Player", "desktopEntry": "app-one"}
+    window.state = {"sources": [source], "selectedSource": source["id"]}
+
+    def color(icon):
+        return icon.pixmap(16, 16).toImage().pixelColor(8, 8).name()
+
+    class TestMenu(qt_frontend.QMenu):
+        def exec(self, position):
+            assert color(self.actions()[0].icon()) == "#ff0000"
+
+    monkeypatch.setattr(qt_frontend, "QMenu", TestMenu)
+    window.open_source_menu()
+    window.open_settings()
+    panel = window.side_panel
+    assert color(panel.source.itemIcon(0)) == "#ff0000"
+    panel.sync_settings({**window.state, "sources": [{**source, "desktopEntry": "app-two"}]})
+    assert color(panel.source.itemIcon(0)) == "#0000ff"
+    assert panel.source.currentData() == source["id"]
+
+
 @pytest.mark.parametrize("selected,status,expected", [
     ("mpris:org.mpris.MediaPlayer2.first", "playing", True),
     ("mpris:org.mpris.MediaPlayer2.first", "paused", False),
@@ -1292,6 +1823,32 @@ def test_qt_startup_prefers_playing_computer_app_once(window, monkeypatch, selec
     window.refresh_state()
     window.refresh_state()
     assert calls == (["mpris:org.mpris.MediaPlayer2.player"] if expected else [])
+    assert window.source_prompt.isHidden()
+
+
+@pytest.mark.parametrize("selected,expected", [
+    ("mpris:org.mpris.MediaPlayer2.example.instance2", []),
+    ("mpris:org.mpris.MediaPlayer2.other", ["mpris:org.mpris.MediaPlayer2.example.instance2"]),
+])
+def test_startup_prefers_last_selected_instance_of_playing_app(window, monkeypatch, selected, expected):
+    sources = [
+        {"id": "mpris:org.mpris.MediaPlayer2.example.instance1",
+         "label": "Example 1", "identity": "Example Web Browser", "application": "example",
+         "status": "playing"},
+        {"id": "mpris:org.mpris.MediaPlayer2.example.instance2",
+         "label": "Example 2", "identity": "Example", "application": "example",
+         "status": "paused", "lastSelected": True},
+        {"id": "mpris:org.mpris.MediaPlayer2.other",
+         "label": "Other", "identity": "Other", "application": "other", "status": "paused"},
+    ]
+    state = {"track": {}, "sources": sources, "selectedSource": selected}
+    calls = []
+    monkeypatch.setattr(window.backend, "get_state", lambda: state)
+    monkeypatch.setattr(window.backend, "set_source", lambda source: (calls.append(source) or True, ""))
+    window.prefer_playing_source_on_start = True
+    window.refresh_state()
+    window.refresh_state()
+    assert calls == expected
 
 
 def test_source_selection_reports_failure(window, monkeypatch):
@@ -1313,6 +1870,311 @@ def test_source_selection_reports_backend_warning(window, monkeypatch):
                         lambda parent, title, message: warnings.append(message))
     window.change_source("mpris:org.mpris.MediaPlayer2.other")
     assert warnings == ["Unable to pause"]
+
+
+def test_source_prompt_appears_on_new_playback_and_switches(window):
+    first = "mpris:org.mpris.MediaPlayer2.first"
+    other = "mpris:org.mpris.MediaPlayer2.other"
+    state = {"selectedSource": first, "sourcePromptSeconds": 17, "track": {}, "sources": [
+        {"id": first, "label": "First", "status": "playing"},
+        {"id": other, "label": "Other", "status": "paused"},
+    ]}
+    window.backend.get_state.return_value = state
+    window.refresh_state()
+    assert window.source_prompt.isHidden()
+    state["sources"][1]["status"] = "playing"
+    window.refresh_state()
+    assert not window.source_prompt.isHidden()
+    assert window.source_prompt_label.text() == "Other started playing. Switch source?"
+    assert window.source_prompt_timer.interval() == 17000
+    assert window.source_prompt.x() == (window.centralWidget().width() - window.source_prompt.width()) // 2
+    assert window.source_prompt.y() == 12
+    window.resize(800, 600)
+    QApplication.processEvents()
+    assert window.source_prompt.x() == (window.centralWidget().width() - window.source_prompt.width()) // 2
+    window.open_settings()
+    QTest.mouseClick(window.source_prompt_switch, Qt.MouseButton.LeftButton)
+    window.backend.set_source.assert_called_once_with(other)
+    assert window.source_prompt.isHidden()
+    assert window.side_panel is not None
+    window.refresh_state()
+    assert window.source_prompt.isHidden()
+
+
+def test_source_prompt_timeout_and_dismiss_only_reappear_on_new_playback(window):
+    first = "mpris:org.mpris.MediaPlayer2.first"
+    other = "mpris:org.mpris.MediaPlayer2.other"
+    state = {"selectedSource": first, "track": {}, "sources": [
+        {"id": first, "label": "First", "status": "playing"},
+        {"id": other, "label": "Other", "status": "paused"},
+    ]}
+    window.backend.get_state.return_value = state
+    window.refresh_state()
+    state["sources"][1]["status"] = "playing"
+    window.refresh_state()
+    window.source_prompt_timer.start(20)
+    QTest.qWait(60)
+    assert window.source_prompt.isHidden()
+    window.refresh_state()
+    assert window.source_prompt.isHidden()
+    state["sources"][1]["status"] = "paused"
+    window.refresh_state()
+    state["sources"][1]["status"] = "playing"
+    window.refresh_state()
+    assert not window.source_prompt.isHidden()
+    QTest.mouseClick(window.source_prompt_dismiss, Qt.MouseButton.LeftButton)
+    assert window.source_prompt.isHidden()
+    window.backend.set_source.assert_not_called()
+
+
+def test_source_prompts_queue_and_discard_stale_sources(window):
+    first = "mpris:org.mpris.MediaPlayer2.first"
+    second = "mpris:org.mpris.MediaPlayer2.second"
+    third = "mpris:org.mpris.MediaPlayer2.third"
+    state = {"selectedSource": first, "track": {}, "sources": [
+        {"id": first, "label": "First", "status": "playing"},
+        {"id": second, "label": "Second", "status": "paused"},
+        {"id": third, "label": "Third", "status": "paused"},
+    ]}
+    window.backend.get_state.return_value = state
+    window.refresh_state()
+    state["sources"][1]["status"] = "playing"
+    state["sources"][2]["status"] = "playing"
+    window.refresh_state()
+    assert window._source_prompt_id == second
+    state["sources"][1]["status"] = "paused"
+    window.refresh_state()
+    assert window._source_prompt_id == third
+    state["sources"] = state["sources"][:2]
+    window.refresh_state()
+    assert window.source_prompt.isHidden()
+    window.backend.set_source.assert_not_called()
+
+
+def test_source_prompts_show_queued_playing_sources_in_order(window):
+    first = "mpris:org.mpris.MediaPlayer2.first"
+    state = {"selectedSource": first, "track": {}, "sources": [
+        {"id": first, "label": "First", "status": "playing"},
+        {"id": "second", "label": "Second", "status": "paused"},
+        {"id": "third", "label": "Third", "status": "paused"},
+    ]}
+    window.backend.get_state.return_value = state
+    window.refresh_state()
+    state["sources"][1]["status"] = state["sources"][2]["status"] = "playing"
+    window.refresh_state()
+    assert window._source_prompt_id == "second"
+    QTest.mouseClick(window.source_prompt_dismiss, Qt.MouseButton.LeftButton)
+    assert window._source_prompt_id == "third"
+    assert not window.source_prompt.isHidden()
+
+
+def test_source_prompt_tracks_new_and_manually_selected_sources(window):
+    first = "mpris:org.mpris.MediaPlayer2.first"
+    other = "mpris:org.mpris.MediaPlayer2.other"
+    state = {"selectedSource": first, "track": {}, "sources": [
+        {"id": first, "label": "First", "status": "playing"},
+    ]}
+    window.backend.get_state.return_value = state
+    window.refresh_state()
+    state["sources"].append({"id": other, "label": "Other", "status": "playing"})
+    window.refresh_state()
+    assert window._source_prompt_id == other
+    state["selectedSource"] = other
+    window.refresh_state()
+    assert window.source_prompt.isHidden()
+    assert not window.source_prompt_timer.isActive()
+
+
+def test_source_prompt_does_not_trigger_background_gestures(window, monkeypatch):
+    first = "mpris:org.mpris.MediaPlayer2.first"
+    other = "mpris:org.mpris.MediaPlayer2.other"
+    state = {"selectedSource": first, "track": {}, "sources": [
+        {"id": first, "label": "First", "status": "playing"},
+        {"id": other, "label": "Other", "status": "paused"},
+    ]}
+    window.backend.get_state.return_value = state
+    window.refresh_state()
+    state["sources"][1]["status"] = "playing"
+    window.refresh_state()
+    actions = []
+    monkeypatch.setattr(window, "open_mode_menu", lambda: actions.append("effects"))
+    monkeypatch.setattr(window, "open_settings", lambda: actions.append("settings"))
+    monkeypatch.setattr(window, "next_visualizer_mode", lambda: actions.append("next"))
+    QTest.mouseClick(window.source_prompt_label, Qt.MouseButton.LeftButton, pos=QPoint(2, 2))
+    QTest.mouseDClick(window.source_prompt, Qt.MouseButton.LeftButton, pos=window.source_prompt.rect().center())
+    assert actions == []
+    assert not window.source_prompt.isHidden()
+
+
+def test_source_prompt_reports_failed_switch_and_remains_available(window, monkeypatch):
+    first = "mpris:org.mpris.MediaPlayer2.first"
+    other = "mpris:org.mpris.MediaPlayer2.other"
+    state = {"selectedSource": first, "track": {}, "sources": [
+        {"id": first, "label": "First", "status": "playing"},
+        {"id": other, "label": "Other", "status": "paused"},
+    ]}
+    window.backend.get_state.return_value = state
+    window.refresh_state()
+    state["sources"][1]["status"] = "playing"
+    window.refresh_state()
+    window.backend.set_source.side_effect = OSError("unavailable")
+    warnings = []
+    monkeypatch.setattr(qt_frontend.QMessageBox, "warning",
+                        lambda _parent, _title, message: warnings.append(message))
+    QTest.mouseClick(window.source_prompt_switch, Qt.MouseButton.LeftButton)
+    assert warnings == ["Source could not be changed: unavailable"]
+    assert not window.source_prompt.isHidden()
+    assert window.source_prompt_timer.isActive()
+
+
+def test_source_prompt_duration_settings_apply_and_reset(window):
+    window.open_settings()
+    panel = window.side_panel
+    assert panel.source_prompt_seconds.value() == 10
+    panel.source_prompt_seconds.setValue(20)
+    window.backend.update_setting.assert_called_once_with("source-prompt-seconds", 20, None)
+    panel.reset_button.click()
+    assert panel.source_prompt_seconds.value() == 10
+    assert window.backend.update_setting.call_args.args == ("source-prompt-seconds", 10, None)
+
+
+def test_source_prompt_duration_setting_reports_save_failure(window):
+    window.open_settings()
+    panel = window.side_panel
+    panel.source_prompt_seconds.setValue(20)
+    window.backend.update_setting.side_effect = OSError("disk full")
+    panel.source_prompt_seconds.setValue(25)
+    assert "disk full" in panel.status.text()
+    assert panel.source_prompt_seconds.value() == 20
+
+
+def test_source_prompt_toggle_disables_duration_and_dismisses_prompt(window, monkeypatch):
+    first = "mpris:org.mpris.MediaPlayer2.first"
+    other = "mpris:org.mpris.MediaPlayer2.other"
+    state = {"selectedSource": first, "track": {}, "sourcePromptEnabled": True, "sources": [
+        {"id": first, "label": "First", "status": "playing"},
+        {"id": other, "label": "Other", "status": "paused"},
+    ]}
+    window.backend.get_state.return_value = state
+    def update(name, value, source_id=None):
+        if name == "source-prompt-enabled":
+            state["sourcePromptEnabled"] = value
+        return ""
+    monkeypatch.setattr(window.backend, "update_setting", update)
+    window.refresh_state()
+    state["sources"][1]["status"] = "playing"
+    window.refresh_state()
+    assert not window.source_prompt.isHidden()
+    window.open_settings()
+    panel = window.side_panel
+    assert panel.source_prompt_seconds.isEnabled()
+    panel.source_prompt_enabled.setChecked(False)
+    assert not panel.source_prompt_seconds.isEnabled()
+    assert not panel.source_prompt_seconds_value.isEnabled()
+    assert not panel.slider_labels[panel.source_prompt_seconds].isEnabled()
+    QApplication.processEvents()
+    assert panel.source_prompt_seconds_value.palette().color(
+        QPalette.ColorGroup.Disabled, QPalette.ColorRole.WindowText).name() == "#78839a"
+    assert window.source_prompt.isHidden()
+    window.refresh_state()
+    panel.source_prompt_enabled.setChecked(True)
+    assert panel.source_prompt_seconds.isEnabled()
+    window.refresh_state()
+    assert window.source_prompt.isHidden()
+    state["sources"][1]["status"] = "paused"
+    window.refresh_state()
+    state["sources"][1]["status"] = "playing"
+    window.refresh_state()
+    assert not window.source_prompt.isHidden()
+
+
+def test_source_prompt_toggle_failure_restores_duration_enabled_state(window, monkeypatch):
+    def fail(*args):
+        raise OSError("disk full")
+    monkeypatch.setattr(window.backend, "update_setting", fail)
+    window.open_settings()
+    panel = window.side_panel
+    panel.source_prompt_enabled.setChecked(False)
+    assert panel.source_prompt_enabled.isChecked()
+    assert panel.source_prompt_seconds.isEnabled()
+    assert "disk full" in panel.status.text()
+
+
+def test_settings_reset_defaults_keeps_source_and_system_volume(window, monkeypatch):
+    first = "mpris:org.mpris.MediaPlayer2.first"
+    second = "mpris:org.mpris.MediaPlayer2.second"
+    window.state = {
+        "track": {}, "selectedSource": first, "systemVolume": 65, "sampleRate": 96000,
+        "sourcePromptSeconds": 25, "sourcePromptEnabled": False, "showPhotosensitivityWarning": False,
+        "sourceGains": {first: 2.0, second: 3.0},
+        "sources": [{"id": first, "label": "First"}, {"id": second, "label": "Second"}],
+    }
+    actions = []
+    monkeypatch.setattr(window.backend, "update_setting",
+                        lambda name, value, source_id=None: actions.append((name, value, source_id)))
+    window.open_settings()
+    panel = window.side_panel
+    assert not panel.source_prompt_seconds.isEnabled()
+    panel.reset_button.click()
+    assert panel.source.currentData() == first
+    assert panel.system_volume.value() == 65
+    assert panel.sample_rate.currentData() == 48000
+    assert panel.source_prompt_seconds.value() == 10
+    assert panel.source_prompt_seconds.isEnabled()
+    assert panel.source_prompt_enabled.isChecked()
+    assert panel.show_photosensitivity_warning.isChecked()
+    assert panel.source_gain.value() == 10
+    assert set(actions) == {
+        ("sample-rate", 48000, None), ("source-prompt-seconds", 10, None),
+        ("source-prompt-enabled", True, None), ("show-photosensitivity-warning", True, None),
+        ("source-gain", 1.0, first), ("source-gain", 1.0, second),
+    }
+
+
+def test_settings_reset_reports_failed_gain_and_keeps_saved_value(window, monkeypatch):
+    first = "mpris:org.mpris.MediaPlayer2.first"
+    second = "mpris:org.mpris.MediaPlayer2.second"
+    window.state = {
+        "track": {}, "selectedSource": first, "sourceGains": {first: 1.5, second: 2.0},
+        "sources": [{"id": first, "label": "First"}, {"id": second, "label": "Second"}],
+    }
+    def update(name, value, source_id=None):
+        if name == "source-gain" and source_id == first:
+            raise OSError("disk full")
+        return ""
+    monkeypatch.setattr(window.backend, "update_setting", update)
+    window.open_settings()
+    panel = window.side_panel
+    panel.reset_button.click()
+    assert panel.source_gain.value() == 15
+    assert panel.source_gains == {first: 1.5, second: 1.0}
+    assert "disk full" in panel.status.text()
+
+
+def test_settings_sync_external_values_without_overwriting_drag(window):
+    first = "mpris:org.mpris.MediaPlayer2.first"
+    second = "mpris:org.mpris.MediaPlayer2.second"
+    state = {"selectedSource": first, "sourceGains": {first: 1.5, second: 2.0},
+             "systemVolume": 50, "sources": [{"id": first, "label": "First"}]}
+    window.state = state
+    window.open_settings()
+    panel = window.side_panel
+    panel.source_gain.setSliderDown(True)
+    panel.sync_settings({**state, "sourceGains": {first: 1.1}})
+    assert panel.source_gain.value() == 15
+    panel.source_gain.setSliderDown(False)
+    panel.sync_settings({**state, "selectedSource": second, "systemVolume": 70,
+                         "sourcePromptEnabled": False,
+                         "sources": state["sources"] + [{"id": second, "label": "Second"}]})
+    assert panel.source.currentData() == second
+    assert panel.source_gain.value() == 20
+    assert panel.system_volume.value() == 70
+    assert not panel.source_prompt_seconds.isEnabled()
+    panel.source_gain.setSliderDown(True)
+    panel.sync_settings({**state, "selectedSource": first, "sourceGains": {first: 1.5},
+                         "sources": [{"id": first, "label": "First"}]})
+    assert not panel.source_gain.isSliderDown()
+    assert panel.source_gain.value() == 15
 
 
 def test_edge_glow_obeys_opacity_and_no_visualisation_mode(window):
@@ -1405,6 +2267,7 @@ def test_visual_options_apply_immediately_and_reset(window, monkeypatch):
     ("albumArtOpacity", 60, "album-art-opacity/60"),
     ("lightingMode", "disco", "lighting-mode/disco"),
     ("lightingColorMode", "rainbow", "lighting-color-mode/rainbow"),
+    ("lightingColorMode", "christmas", "lighting-color-mode/christmas"),
     ("edgeSwirl", True, "edge-swirl/true"),
     ("edgeColorIntensity", 40, "edge-color-intensity/40"),
     ("edgeFade", 20, "edge-fade/20"),
@@ -1413,6 +2276,9 @@ def test_visual_options_apply_immediately_and_reset(window, monkeypatch):
     ("edgeDepth", 150, "edge-depth/150"),
     ("discoLightCount", 20, "disco-light-count/20"),
     ("discoLightSize", 150, "disco-light-size/150"),
+    ("discoLightStyle", "star", "disco-light-style/star"),
+    ("discoWireColor", "theme", "disco-wire-color/theme"),
+    ("discoWireColor", "none", "disco-wire-color/none"),
     ("edgeSwirlSlowdown", 5, "edge-swirl-slowdown/5"),
     ("edgeSwirlDirection", "random", "edge-swirl-direction/random"),
 ])
@@ -1445,7 +2311,7 @@ def test_visual_panel_sync_does_not_send_requests(window, monkeypatch):
     monkeypatch.setattr(window.backend, "update_setting", lambda name, value, source_id=None: actions.append((name, value, source_id)))
     window.open_mode_menu()
     panel = window.side_panel
-    panel.sync_visual({"edgeDepth": 150, "lightingMode": "none"})
+    panel.sync_fields({"edgeDepth": 150, "lightingMode": "none"})
     assert panel.edge_depth.value() == 150
     assert panel.edge_depth_value.text() == "150%"
     assert not panel.edge_swirl.isEnabled()
@@ -1454,11 +2320,13 @@ def test_visual_panel_sync_does_not_send_requests(window, monkeypatch):
 
 def test_reset_restores_all_visual_settings(window):
     state = {
-        "visualizerMode": 2, "scopeZeroLine": False, "artworkMode": "logo", "albumArtOpacity": 60,
+        "visualizerMode": 2, "scopeZeroLine": False, "scopeLineWidth": 200,
+        "artworkMode": "logo", "albumArtOpacity": 60,
         "lightingMode": "disco", "lightingColorMode": "rainbow", "edgeSwirl": True,
         "edgeColorIntensity": 40, "edgeFade": 20, "edgeOpacity": 80,
         "edgeColorCount": 3, "edgeDepth": 150, "discoLightCount": 20,
         "discoLightSize": 150, "edgeSwirlSlowdown": 5, "edgeSwirlDirection": "random",
+        "discoLightStyle": "fairy", "discoWireColor": "theme",
     }
     actions = []
     panel = SidePanel(state, "visual", qt_frontend.QT_MODES,
@@ -1470,27 +2338,16 @@ def test_reset_restores_all_visual_settings(window):
         assert (path, default) in actions
 
 
-def test_settings_save_cancel_and_failure(window, monkeypatch):
+def test_settings_apply_immediately_and_restore_failed_change(window, monkeypatch):
     actions = []
     monkeypatch.setattr(window.backend, "update_setting", lambda name, value, source_id=None: actions.append((name, value, source_id)))
-    monkeypatch.setattr(qt_frontend.QMessageBox, "question",
-                        lambda *args: qt_frontend.QMessageBox.StandardButton.Discard)
     window.open_settings()
     panel = window.side_panel
     panel.sample_rate.setCurrentIndex(panel.sample_rate.findData(44100))
     panel.source_gain.setValue(25)
-    assert actions == []
-    panel.cancel_button.click()
-    wait_for_panel_animation(window)
-    assert window.side_panel is None
-    assert actions == []
-    window.open_settings()
-    panel = window.side_panel
-    panel.sample_rate.setCurrentIndex(panel.sample_rate.findData(44100))
-    panel.source_gain.setValue(25)
-    panel.save_button.click()
     assert actions == [("sample-rate", 44100, None),
                        ("source-gain", 2.5, "mpris:org.mpris.MediaPlayer2.player")]
+    panel.close_button.click()
     wait_for_panel_animation(window)
     assert window.side_panel is None
 
@@ -1500,35 +2357,26 @@ def test_settings_save_cancel_and_failure(window, monkeypatch):
     window.open_settings()
     panel = window.side_panel
     panel.sample_rate.setCurrentIndex(panel.sample_rate.findData(44100))
-    panel.save_button.click()
     assert window.side_panel is panel
+    assert panel.sample_rate.currentData() == 48000
     assert "connection failed" in panel.status.text()
 
 
 @pytest.mark.parametrize("initial", [True, False])
-def test_startup_warning_setting_respects_discard_and_save(window, monkeypatch, initial):
+def test_startup_warning_setting_applies_and_is_last(window, monkeypatch, initial):
     window.state["showPhotosensitivityWarning"] = initial
     actions = []
     monkeypatch.setattr(window.backend, "update_setting",
                         lambda name, value, source_id=None: actions.append((name, value)))
-    monkeypatch.setattr(qt_frontend.QMessageBox, "question",
-                        lambda *args: qt_frontend.QMessageBox.StandardButton.Discard)
     window.open_settings()
     panel = window.side_panel
     assert panel.content_layout.itemAt(panel.content_layout.count() - 2).widget() is panel.show_photosensitivity_warning
     assert panel.show_photosensitivity_warning.isChecked() is initial
     panel.show_photosensitivity_warning.setChecked(not initial)
-    assert panel.has_unsaved_settings()
-    panel.cancel_button.click()
-    wait_for_panel_animation(window)
-    assert actions == []
-    window.open_settings()
-    panel = window.side_panel
-    assert panel.show_photosensitivity_warning.isChecked() is initial
-    panel.show_photosensitivity_warning.setChecked(not initial)
-    panel.save_button.click()
     assert actions == [("show-photosensitivity-warning", not initial)]
     assert window.state["showPhotosensitivityWarning"] is not initial
+    panel.reset_button.click()
+    assert panel.show_photosensitivity_warning.isChecked()
 
 
 def test_startup_warning_setting_reports_save_failure(window, monkeypatch):
@@ -1538,13 +2386,38 @@ def test_startup_warning_setting_reports_save_failure(window, monkeypatch):
     window.open_settings()
     panel = window.side_panel
     panel.show_photosensitivity_warning.setChecked(False)
-    panel.save_button.click()
     assert window.side_panel is panel
-    assert panel.has_unsaved_settings()
+    assert panel.show_photosensitivity_warning.isChecked()
     assert "disk full" in panel.status.text()
 
 
-def test_settings_save_source_system_volume_and_per_source_boost(window, monkeypatch):
+@pytest.mark.parametrize("kind,name", [
+    ("settings", "show_photosensitivity_warning"),
+    ("settings", "source_prompt_enabled"),
+    ("visual", "edge_swirl"),
+])
+def test_panel_checkboxes_show_outline_and_checkmark(window, kind, name):
+    window.open_side_panel(kind)
+    checkbox = getattr(window.side_panel, name)
+    window.side_panel.scroll.ensureWidgetVisible(checkbox)
+    option = QStyleOptionButton()
+    checkbox.initStyleOption(option)
+    rect = checkbox.style().subElementRect(QStyle.SubElement.SE_CheckBoxIndicator, option, checkbox)
+    checkbox.setChecked(False)
+    unchecked = checkbox.grab().toImage()
+    checkbox.setChecked(True)
+    checked = checkbox.grab().toImage()
+    ratio = checked.devicePixelRatio()
+    def pixel(image, x, y):
+        return image.pixelColor(round(x * ratio), round(y * ratio))
+    assert pixel(unchecked, rect.left(), rect.center().y()).name() == "#718cc1"
+    assert pixel(checked, rect.left(), rect.center().y()).name() == "#718cc1"
+    assert any(pixel(checked, x, y).lightness() > 200 and pixel(unchecked, x, y).lightness() < 100
+               for x in range(rect.left() + 2, rect.right() - 1)
+               for y in range(rect.top() + 2, rect.bottom() - 1))
+
+
+def test_settings_apply_source_system_volume_and_per_source_boost(window, monkeypatch):
     first = "mpris:org.mpris.MediaPlayer2.first"
     second = "mpris:org.mpris.MediaPlayer2.second"
     window.state = {
@@ -1562,12 +2435,29 @@ def test_settings_save_source_system_volume_and_per_source_boost(window, monkeyp
     assert panel.source_gain.value() == 20
     panel.source_gain.setValue(30)
     panel.system_volume.setValue(65)
-    panel.save_button.click()
     assert actions == [
-        ("source", second, None),
-        ("system-volume", 65, None), ("source-gain", 2.0, first),
+        ("source-gain", 2.0, first), ("source", second, None),
         ("source-gain", 3.0, second),
+        ("system-volume", 65, None),
     ]
+
+
+def test_settings_source_failure_restores_source_and_gain(window, monkeypatch):
+    first = "mpris:org.mpris.MediaPlayer2.first"
+    second = "mpris:org.mpris.MediaPlayer2.second"
+    window.state = {
+        "selectedSource": first, "sourceGains": {first: 1.5, second: 2.0},
+        "sources": [{"id": first, "label": "First"}, {"id": second, "label": "Second"}],
+    }
+    def fail(*args):
+        raise OSError("unavailable")
+    monkeypatch.setattr(window.backend, "update_setting", fail)
+    window.open_settings()
+    panel = window.side_panel
+    panel.source.setCurrentIndex(panel.source.findData(second))
+    assert panel.source.currentData() == first
+    assert panel.source_gain.value() == 15
+    assert "unavailable" in panel.status.text()
 
 
 def test_closing_qt_stops_backend(window):
@@ -1575,7 +2465,7 @@ def test_closing_qt_stops_backend(window):
     window.backend.stop.assert_called_once()
 
 
-def test_discarding_settings_does_not_change_source_or_system_volume(window, monkeypatch):
+def test_closing_settings_keeps_applied_source_and_system_volume(window, monkeypatch):
     first = "mpris:org.mpris.MediaPlayer2.first"
     second = "mpris:org.mpris.MediaPlayer2.second"
     window.state = {
@@ -1584,15 +2474,13 @@ def test_discarding_settings_does_not_change_source_or_system_volume(window, mon
     }
     actions = []
     monkeypatch.setattr(window.backend, "update_setting", lambda name, value, source_id=None: actions.append((name, value, source_id)))
-    monkeypatch.setattr(qt_frontend.QMessageBox, "question",
-                        lambda *args: qt_frontend.QMessageBox.StandardButton.Discard)
     window.open_settings()
     panel = window.side_panel
     panel.source.setCurrentIndex(panel.source.findData(second))
     panel.system_volume.setValue(75)
-    panel.cancel_button.click()
+    panel.close_button.click()
     wait_for_panel_animation(window)
-    assert actions == []
+    assert actions == [("source", second, None), ("system-volume", 75, None)]
     assert window.side_panel is None
 
 
@@ -1613,22 +2501,15 @@ def test_side_panel_slides_from_edge_and_keeps_controls_visible(window, kind):
     assert window.controls_timer.isActive()
 
 
-def test_switching_panels_can_cancel_or_discard_settings_draft(window, monkeypatch):
+def test_switching_panels_keeps_immediately_applied_settings(window, monkeypatch):
     actions = []
     monkeypatch.setattr(window.backend, "update_setting", lambda name, value, source_id=None: actions.append((name, value, source_id)))
-    monkeypatch.setattr(qt_frontend.QMessageBox, "question",
-                        lambda *args: qt_frontend.QMessageBox.StandardButton.Cancel)
     window.open_settings()
     panel = window.side_panel
     panel.source_gain.setValue(25)
     window.open_mode_menu()
-    assert window.side_panel is panel
-    assert not window.panel_closing
-    monkeypatch.setattr(qt_frontend.QMessageBox, "question",
-                        lambda *args: qt_frontend.QMessageBox.StandardButton.Discard)
-    window.open_mode_menu()
     assert window.side_panel.kind == "visual"
-    assert actions == []
+    assert actions == [("source-gain", 2.5, "mpris:org.mpris.MediaPlayer2.player")]
 
 
 def test_clicking_outside_closes_visual_panel(window):
@@ -1650,30 +2531,20 @@ def test_clicking_settings_outside_visual_panel_opens_settings(window):
     assert window.side_panel.kind == "settings"
 
 
-@pytest.mark.parametrize("choice", ["Save", "Discard", "Cancel"])
-def test_clicking_outside_settings_prompts_for_changes(window, monkeypatch, choice):
+def test_clicking_outside_settings_keeps_immediately_applied_changes(window, monkeypatch):
     actions = []
     prompts = []
     monkeypatch.setattr(window.backend, "update_setting", lambda name, value, source_id=None: actions.append((name, value, source_id)))
-    monkeypatch.setattr(qt_frontend.QMessageBox, "question",
-                        lambda *args: prompts.append(args) or getattr(
-                            qt_frontend.QMessageBox.StandardButton, choice))
+    monkeypatch.setattr(qt_frontend.QMessageBox, "question", lambda *args: prompts.append(args))
     window.open_settings()
     wait_for_panel_animation(window)
     panel = window.side_panel
     panel.source_gain.setValue(25)
     QTest.mouseClick(window.visualizer, Qt.MouseButton.LeftButton, pos=QPoint(10, 100))
-    assert len(prompts) == 1
-    buttons = qt_frontend.QMessageBox.StandardButton
-    assert prompts[0][3] == buttons.Save | buttons.Discard | buttons.Cancel
-    assert prompts[0][4] == buttons.Cancel
-    if choice == "Cancel":
-        assert window.side_panel is panel and not window.panel_closing
-        assert panel.source_gain.value() == 25
-    else:
-        wait_for_panel_animation(window)
-        assert window.side_panel is None
-    assert actions == ([("source-gain", 2.5, "mpris:org.mpris.MediaPlayer2.player")] if choice == "Save" else [])
+    wait_for_panel_animation(window)
+    assert window.side_panel is None
+    assert not prompts
+    assert actions == [("source-gain", 2.5, "mpris:org.mpris.MediaPlayer2.player")]
 
 
 def test_clicking_outside_unchanged_settings_closes_without_prompt(window, monkeypatch):
@@ -1687,22 +2558,9 @@ def test_clicking_outside_unchanged_settings_closes_without_prompt(window, monke
     assert not prompts
 
 
-def test_clicking_visual_button_with_cancelled_settings_prompt_keeps_panel(window, monkeypatch):
-    monkeypatch.setattr(qt_frontend.QMessageBox, "question",
-                        lambda *args: qt_frontend.QMessageBox.StandardButton.Cancel)
-    window.open_settings()
-    wait_for_panel_animation(window)
-    panel = window.side_panel
-    panel.source_gain.setValue(25)
-    QTest.mouseClick(window.mode_button, Qt.MouseButton.LeftButton)
-    assert window.side_panel is panel and not window.panel_closing
-
-
-def test_clicking_visual_button_saves_settings_before_switching(window, monkeypatch):
+def test_clicking_visual_button_keeps_applied_settings(window, monkeypatch):
     actions = []
     monkeypatch.setattr(window.backend, "update_setting", lambda name, value, source_id=None: actions.append((name, value, source_id)))
-    monkeypatch.setattr(qt_frontend.QMessageBox, "question",
-                        lambda *args: qt_frontend.QMessageBox.StandardButton.Save)
     window.open_settings()
     wait_for_panel_animation(window)
     window.side_panel.source_gain.setValue(25)
@@ -1711,92 +2569,23 @@ def test_clicking_visual_button_saves_settings_before_switching(window, monkeypa
     assert actions == [("source-gain", 2.5, "mpris:org.mpris.MediaPlayer2.player")]
 
 
-def test_reverting_settings_draft_closes_without_prompt(window, monkeypatch):
+@pytest.mark.parametrize("close_method", ["close", "escape", "toggle"])
+def test_settings_close_paths_do_not_prompt(window, monkeypatch, close_method):
     prompts = []
     monkeypatch.setattr(qt_frontend.QMessageBox, "question", lambda *args: prompts.append(args))
-    window.open_settings()
-    panel = window.side_panel
-    panel.source_gain.setValue(25)
-    panel.source_gain.setValue(10)
-    panel.close_button.click()
-    wait_for_panel_animation(window)
-    assert window.side_panel is None
-    assert not prompts
-
-
-@pytest.mark.parametrize("close_method", ["close", "cancel", "escape", "toggle"])
-def test_settings_close_paths_prompt_for_unsaved_changes(window, monkeypatch, close_method):
-    prompts = []
-    monkeypatch.setattr(qt_frontend.QMessageBox, "question",
-                        lambda *args: prompts.append(args) or qt_frontend.QMessageBox.StandardButton.Cancel)
     window.open_settings()
     wait_for_panel_animation(window)
     panel = window.side_panel
     panel.sample_rate.setCurrentIndex(panel.sample_rate.findData(44100))
     if close_method == "close":
         panel.close_button.click()
-    elif close_method == "cancel":
-        panel.cancel_button.click()
     elif close_method == "escape":
         QTest.keyClick(panel.sample_rate, Qt.Key.Key_Escape)
     else:
         QTest.mouseClick(window.settings_button, Qt.MouseButton.LeftButton)
-    assert len(prompts) == 1
-    assert window.side_panel is panel and not window.panel_closing
-
-
-def test_failed_prompt_save_keeps_settings_open(window, monkeypatch):
-    def fail(*args):
-        raise OSError("connection failed")
-    monkeypatch.setattr(window.backend, "update_setting", fail)
-    monkeypatch.setattr(qt_frontend.QMessageBox, "question",
-                        lambda *args: qt_frontend.QMessageBox.StandardButton.Save)
-    window.open_settings()
     wait_for_panel_animation(window)
-    panel = window.side_panel
-    panel.sample_rate.setCurrentIndex(panel.sample_rate.findData(44100))
-    QTest.mouseClick(window.visualizer, Qt.MouseButton.LeftButton, pos=QPoint(10, 100))
-    assert window.side_panel is panel and not window.panel_closing
-    assert "connection failed" in panel.status.text()
-
-
-def test_window_close_respects_unsaved_settings_cancel(window, monkeypatch):
-    monkeypatch.setattr(qt_frontend.QMessageBox, "question",
-                        lambda *args: qt_frontend.QMessageBox.StandardButton.Cancel)
-    window.open_settings()
-    window.side_panel.sample_rate.setCurrentIndex(
-        window.side_panel.sample_rate.findData(44100)
-    )
-    assert not window.close()
-    window.backend.stop.assert_not_called()
-    monkeypatch.setattr(qt_frontend.QMessageBox, "question",
-                        lambda *args: qt_frontend.QMessageBox.StandardButton.Discard)
-    assert window.close()
-    window.backend.stop.assert_called_once()
-
-
-def test_prompt_retries_only_unsaved_settings_after_partial_failure(window, monkeypatch):
-    actions = []
-    def request(name, value, source_id=None):
-        action = (name, value, source_id)
-        actions.append(action)
-        if name == "source-gain" and actions.count(action) == 1:
-            raise OSError("connection failed")
-    monkeypatch.setattr(window.backend, "update_setting", request)
-    monkeypatch.setattr(qt_frontend.QMessageBox, "question",
-                        lambda *args: qt_frontend.QMessageBox.StandardButton.Save)
-    window.open_settings()
-    panel = window.side_panel
-    panel.sample_rate.setCurrentIndex(panel.sample_rate.findData(44100))
-    panel.source_gain.setValue(25)
-    panel.close_button.click()
-    assert window.side_panel is panel and not window.panel_closing
-    panel.close_button.click()
-    wait_for_panel_animation(window)
+    assert not prompts
     assert window.side_panel is None
-    assert actions == [("sample-rate", 44100, None),
-                       ("source-gain", 2.5, "mpris:org.mpris.MediaPlayer2.player"),
-                       ("source-gain", 2.5, "mpris:org.mpris.MediaPlayer2.player")]
 
 
 def test_escape_closes_panel_without_exiting_fullscreen(window):
@@ -1844,6 +2633,108 @@ def test_panel_sliders_ignore_wheel(window, kind):
     assert slider.value() == before
 
 
+@pytest.mark.parametrize("kind,name,target", [
+    ("visual", "edge_depth", 97),
+    ("visual", "edge_depth", 146),
+    ("settings", "source_prompt_seconds", 26),
+])
+def test_panel_slider_snaps_drag_but_shift_and_keys_allow_fine_values(window, monkeypatch, kind, name, target):
+    actions = []
+    monkeypatch.setattr(window.backend, "update_setting",
+                        lambda name, value, source_id=None: actions.append((name, value)))
+    window.open_side_panel(kind)
+    panel = window.side_panel
+    slider = getattr(panel, name)
+    panel.scroll.ensureWidgetVisible(slider)
+    QApplication.processEvents()
+
+    def drag(value, modifier=Qt.KeyboardModifier.NoModifier):
+        option = QStyleOptionSlider()
+        slider.initStyleOption(option)
+        groove = slider.style().subControlRect(QStyle.ComplexControl.CC_Slider, option,
+                                               QStyle.SubControl.SC_SliderGroove, slider)
+        handle = slider.style().subControlRect(QStyle.ComplexControl.CC_Slider, option,
+                                               QStyle.SubControl.SC_SliderHandle, slider)
+        span = groove.width() - handle.width()
+        x = groove.x() + handle.width() // 2 + QStyle.sliderPositionFromValue(
+            slider.minimum(), slider.maximum(), value, span, option.upsideDown)
+        QTest.mousePress(slider, Qt.MouseButton.LeftButton, modifier, handle.center())
+        point = QPoint(x, handle.center().y())
+        event = QMouseEvent(QEvent.Type.MouseMove, QPointF(point), QPointF(slider.mapToGlobal(point)),
+                            Qt.MouseButton.NoButton, Qt.MouseButton.LeftButton, modifier)
+        QApplication.sendEvent(slider, event)
+        QTest.mouseRelease(slider, Qt.MouseButton.LeftButton, modifier, point)
+
+    drag(target)
+    assert slider.value() == round(target / 10) * 10
+    if kind == "visual" and target == 146:
+        assert actions == [("edge-depth", 150)]
+    drag(target, Qt.KeyboardModifier.ShiftModifier)
+    assert slider.value() == pytest.approx(target, abs=1)
+    value = slider.value()
+    QTest.keyClick(slider, Qt.Key.Key_Right)
+    assert slider.value() == value + 1
+    assert "Shift" in slider.accessibleDescription()
+
+
+def test_slider_snapping_preserves_endpoints_and_programmatic_values(window):
+    window.open_mode_menu()
+    slider = window.side_panel.edge_depth
+    slider.setValue(27)
+    assert slider.value() == 27
+    slider.setSliderDown(True)
+    slider.setSliderPosition(26)
+    assert slider.value() == 25
+    slider.setSliderPosition(199)
+    assert slider.value() == 200
+    slider.setSliderDown(False)
+    count = window.side_panel.edge_count
+    count.setSliderDown(True)
+    count.setSliderPosition(3)
+    assert count.value() == 3
+    count.setSliderDown(False)
+
+
+def test_snapped_slider_restores_committed_value_when_save_fails(window, monkeypatch):
+    actions = []
+    def fail(name, value, source_id=None):
+        actions.append((name, value))
+        raise OSError("disk full")
+    monkeypatch.setattr(window.backend, "update_setting", fail)
+    window.open_mode_menu()
+    panel = window.side_panel
+    panel.edge_depth.setSliderDown(True)
+    panel.edge_depth.setSliderPosition(146)
+    panel.edge_depth.setSliderDown(False)
+    assert actions == [("edge-depth", 150)]
+    assert panel.edge_depth.value() == 100
+    assert panel.edge_depth_value.text() == "100%"
+    assert "disk full" in panel.status.text()
+
+
+@pytest.mark.parametrize("kind,names", [
+    ("visual", ("mode", "artwork_mode", "lighting_mode", "lighting_color_mode", "edge_direction")),
+    ("settings", ("sample_rate", "source")),
+])
+def test_panel_dropdowns_ignore_wheel_but_allow_keyboard_selection(window, kind, names):
+    window.open_side_panel(kind)
+    panel = window.side_panel
+    for name in names:
+        combo = getattr(panel, name)
+        combo.setCurrentIndex(0)
+        combo.setFocus()
+        before = combo.currentIndex()
+        point = QPointF(combo.rect().center())
+        event = QWheelEvent(point, point, QPoint(0, 0), QPoint(0, -120),
+                            Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier,
+                            Qt.ScrollPhase.ScrollUpdate, False)
+        QApplication.sendEvent(combo, event)
+        assert combo.currentIndex() == before
+        if combo.count() > 1:
+            QTest.keyClick(combo, Qt.Key.Key_Down)
+            assert combo.currentIndex() == before + 1
+
+
 def test_volume_popup_slider_ignores_wheel(window, monkeypatch):
     actions = []
     monkeypatch.setattr(window.backend, "update_setting", lambda name, value, source_id=None: actions.append((name, value, source_id)))
@@ -1862,6 +2753,58 @@ def test_volume_popup_slider_ignores_wheel(window, monkeypatch):
     monkeypatch.setattr(qt_frontend, "QMenu", TestMenu)
     window.open_volume_menu()
     assert actions == []
+
+
+def test_volume_popup_is_centered_themed_and_unsnapped(window, monkeypatch):
+    window.state = {**window.state, "systemVolume": 50, "lightingColorMode": "artwork"}
+    colors = [QColor("red"), QColor("lime"), QColor("blue")]
+    window.update_timeline_theme({"colors": colors})
+    actions = []
+    monkeypatch.setattr(window.backend, "update_setting",
+                        lambda name, value, source_id=None: actions.append((name, value)))
+
+    class TestMenu(qt_frontend.QMenu):
+        def exec(self, position):
+            slider = self.actions()[0].defaultWidget()
+            expected = QPoint((window.volume_button.width() - self.sizeHint().width()) // 2,
+                              -self.sizeHint().height())
+            assert position == window.volume_button.mapToGlobal(expected)
+            assert all(color.name() in slider.styleSheet() for color in colors)
+            assert slider.value() == 50 and slider.isEnabled()
+            QTest.keyClick(slider, Qt.Key.Key_Up)
+            assert slider.value() == 51
+            replacement = [QColor("yellow"), QColor("cyan"), QColor("magenta")]
+            window.update_timeline_theme({"colors": replacement})
+            assert all(color.name() in slider.styleSheet() for color in replacement)
+
+    monkeypatch.setattr(qt_frontend, "QMenu", TestMenu)
+    window.open_volume_menu()
+    assert actions == [("system-volume", 51)]
+
+
+def test_volume_popup_disables_unavailable_volume_and_rolls_back_failure(window, monkeypatch):
+    def fail(*args):
+        raise OSError("unavailable")
+    monkeypatch.setattr(window.backend, "update_setting", fail)
+    warnings = []
+    monkeypatch.setattr(qt_frontend.QMessageBox, "warning",
+                        lambda _parent, _title, message: warnings.append(message))
+
+    class TestMenu(qt_frontend.QMenu):
+        def exec(self, position):
+            slider = self.actions()[0].defaultWidget()
+            if window.state.get("systemVolume") is None:
+                assert not slider.isEnabled()
+            else:
+                slider.setValue(70)
+                assert slider.value() == 50
+
+    monkeypatch.setattr(qt_frontend, "QMenu", TestMenu)
+    window.state["systemVolume"] = None
+    window.open_volume_menu()
+    window.state["systemVolume"] = 50
+    window.open_volume_menu()
+    assert warnings == ["Volume could not be changed: unavailable"]
 
 
 def test_unavailable_gpu_selects_cpu_renderer(monkeypatch, capsys):
@@ -1931,9 +2874,9 @@ def test_gpu_surface_renders_halo_with_opengl_painter(window, monkeypatch):
         paint_scene(painter)
 
     monkeypatch.setattr(visualizer, "paint_scene", record_engine)
-    def record_stroke(painter, path, gradient):
+    def record_stroke(painter, path, gradient, line_width=3.5):
         stroke_engines.append(painter.paintEngine().type())
-        paint_scope_path(painter, path, gradient)
+        paint_scope_path(painter, path, gradient, line_width)
 
     monkeypatch.setattr(qt_frontend, "paint_scope_path", record_stroke)
     art = QPixmap(100, 100)
@@ -1955,12 +2898,16 @@ def test_gpu_surface_renders_halo_with_opengl_painter(window, monkeypatch):
 
 
 @pytest.mark.parametrize("swirl", [False, True])
-def test_gpu_surface_renders_disco_with_opengl_painter(window, monkeypatch, swirl):
+@pytest.mark.parametrize("style,wire", [
+    ("glow", "green"), ("bulb", "green"), ("star", "theme"), ("fairy", "none"),
+])
+def test_gpu_surface_renders_disco_with_opengl_painter(window, monkeypatch, swirl, style, wire):
     visualizer = window.visualizer
     if not isinstance(visualizer, qt_frontend.GPUVisualizerWidget):
         pytest.skip("hardware OpenGL widget unavailable")
     border = window.edge_border
     state = {"lightingMode": "disco", "edgeSwirl": swirl,
+             "discoLightStyle": style, "discoWireColor": wire,
              "track": {"status": "playing" if swirl else "paused"},
              "bars": [1.0] * 24 if swirl else []}
     border.opacity = 1

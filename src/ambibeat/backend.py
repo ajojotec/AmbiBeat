@@ -52,8 +52,16 @@ ALBUM_ART_OPACITY_MIN = 0
 ALBUM_ART_OPACITY_MAX = 100
 ALBUM_ART_OPACITY_DEFAULT = 22
 ARTWORK_MODES = ("album", "logo", "none")
+SCOPE_LINE_WIDTH_MIN = 25
+SCOPE_LINE_WIDTH_MAX = 300
+SCOPE_LINE_WIDTH_DEFAULT = 100
+SOURCE_PROMPT_SECONDS_MIN = 3
+SOURCE_PROMPT_SECONDS_MAX = 60
+SOURCE_PROMPT_SECONDS_DEFAULT = 10
 LIGHTING_MODES = ("border", "disco", "none")
-LIGHTING_COLOR_MODES = ("artwork", "rainbow")
+LIGHTING_COLOR_MODES = ("artwork", "rainbow", "christmas")
+DISCO_LIGHT_STYLES = ("glow", "fairy", "bulb", "star")
+DISCO_WIRE_COLORS = ("green", "theme", "none")
 DISCO_LIGHT_COUNT_MIN = 3
 DISCO_LIGHT_COUNT_MAX = 40
 DISCO_LIGHT_COUNT_DEFAULT = 16
@@ -115,6 +123,19 @@ def _load_app_settings():
         settings["sample_rate"] = sample_rate
     elif "sample_rate" in data:
         print("Ignoring invalid saved sample rate", flush=True)
+
+    prompt_seconds = data.get("source_prompt_seconds")
+    if (isinstance(prompt_seconds, int) and not isinstance(prompt_seconds, bool)
+            and SOURCE_PROMPT_SECONDS_MIN <= prompt_seconds <= SOURCE_PROMPT_SECONDS_MAX):
+        settings["source_prompt_seconds"] = prompt_seconds
+    elif "source_prompt_seconds" in data:
+        print("Ignoring invalid saved source prompt duration", flush=True)
+
+    prompt_enabled = data.get("source_prompt_enabled")
+    if isinstance(prompt_enabled, bool):
+        settings["source_prompt_enabled"] = prompt_enabled
+    elif "source_prompt_enabled" in data:
+        print("Ignoring invalid saved source prompt setting", flush=True)
 
     raw_gains = data.get("source_gains", {})
     gains = {}
@@ -183,6 +204,21 @@ def _load_app_settings():
     elif "selected_source" in data:
         print("Ignoring invalid saved playback source", flush=True)
 
+    last_instances = data.get("last_source_instances", {})
+    if isinstance(last_instances, dict):
+        valid_instances = {}
+        for identity, source_id in last_instances.items():
+            if (isinstance(identity, str) and identity and isinstance(source_id, str)
+                    and source_id.startswith(f"mpris:{MPRIS_PREFIX}")
+                    and len(source_id) > len(f"mpris:{MPRIS_PREFIX}")):
+                valid_instances[identity] = source_id
+            else:
+                print("Ignoring invalid saved playback instance", flush=True)
+        if valid_instances or "last_source_instances" in data:
+            settings["last_source_instances"] = valid_instances
+    else:
+        print("Ignoring invalid saved playback instances", flush=True)
+
     visualizer_mode = data.get("visualizer_mode")
     if (
         isinstance(visualizer_mode, int)
@@ -206,6 +242,13 @@ def _load_app_settings():
     elif "scope_zero_line" in data:
         print("Ignoring invalid saved scope zero line setting", flush=True)
 
+    scope_line_width = data.get("scope_line_width")
+    if (isinstance(scope_line_width, int) and not isinstance(scope_line_width, bool)
+            and SCOPE_LINE_WIDTH_MIN <= scope_line_width <= SCOPE_LINE_WIDTH_MAX):
+        settings["scope_line_width"] = scope_line_width
+    elif "scope_line_width" in data:
+        print("Ignoring invalid saved scope line width", flush=True)
+
     edge_swirl = data.get("edge_swirl")
     if isinstance(edge_swirl, bool):
         settings["edge_swirl"] = edge_swirl
@@ -223,6 +266,18 @@ def _load_app_settings():
         settings["lighting_color_mode"] = lighting_color_mode
     elif "lighting_color_mode" in data:
         print("Ignoring invalid saved lighting colour mode", flush=True)
+
+    disco_light_style = data.get("disco_light_style")
+    if disco_light_style in DISCO_LIGHT_STYLES:
+        settings["disco_light_style"] = disco_light_style
+    elif "disco_light_style" in data:
+        print("Ignoring invalid saved light style", flush=True)
+
+    disco_wire_color = data.get("disco_wire_color")
+    if disco_wire_color in DISCO_WIRE_COLORS:
+        settings["disco_wire_color"] = disco_wire_color
+    elif "disco_wire_color" in data:
+        print("Ignoring invalid saved light wire colour", flush=True)
 
     for key, minimum, maximum in (
         ("disco_light_count", DISCO_LIGHT_COUNT_MIN, DISCO_LIGHT_COUNT_MAX),
@@ -348,6 +403,11 @@ def _normalize_metadata(value):
     return " ".join(re.sub(r"[^a-z0-9]+", " ", ascii_text).split())
 
 
+def _source_application_key(identity):
+    name = " ".join(identity.casefold().split())
+    return re.sub(r"\s+(?:web browser|media player)$", "", name) or name
+
+
 def _normalize_track_title(value):
     normalized = _normalize_metadata(value)
     for separator in (" feat ", " featuring ", " ft ", " with "):
@@ -456,6 +516,13 @@ def _mpris_track_info(identity, player_properties):
         artist = artists
     else:
         artist = ", ".join(str(value) for value in artists)
+    duration = metadata.get("mpris:length")
+    position = player_properties.get("Position")
+    duration = int(duration) if isinstance(duration, int) and not isinstance(duration, bool) and duration > 0 else None
+    position = int(position) if isinstance(position, int) and not isinstance(position, bool) and position >= 0 else None
+    track_id = str(metadata.get("mpris:trackid", ""))
+    rate = player_properties.get("Rate", 1.0)
+    rate = float(rate) if isinstance(rate, (int, float)) and math.isfinite(rate) and rate > 0 else 1.0
     return {
         "title": str(metadata.get("xesam:title", "Unknown Title")),
         "artist": artist or identity,
@@ -463,6 +530,14 @@ def _mpris_track_info(identity, player_properties):
         "status": str(player_properties.get("PlaybackStatus", "Stopped")).lower(),
         "device": identity,
         "art": "",
+        "duration": duration,
+        "position": position,
+        "positionUpdatedAt": time.monotonic(),
+        "playbackRate": rate,
+        "trackId": track_id,
+        "canSeek": bool(player_properties.get("CanSeek", False))
+                   and track_id.startswith("/") and track_id != "/org/mpris/MediaPlayer2/TrackList/NoTrack"
+                   and duration is not None and position is not None,
     }, str(metadata.get("mpris:artUrl", "")), str(metadata.get("kde:pid", ""))
 
 
@@ -696,6 +771,8 @@ class AmbiBeatBackend:
             "photosensitivity_warning_acknowledged", False
         )
         self.sample_rate = settings.get("sample_rate", self.sample_rate)
+        self.source_prompt_seconds = settings.get("source_prompt_seconds", SOURCE_PROMPT_SECONDS_DEFAULT)
+        self.source_prompt_enabled = settings.get("source_prompt_enabled", True)
         self.source_volume = SourceVolume(
             settings.get("source_gains", {}), settings.get("volume_journal", {}),
             self._save_settings, self._source_process_ids,
@@ -705,9 +782,12 @@ class AmbiBeatBackend:
         self._last_system_volume_error = ""
         self.visualizer_mode = settings.get("visualizer_mode", 0)
         self.scope_zero_line = settings.get("scope_zero_line", True)
+        self.scope_line_width = settings.get("scope_line_width", SCOPE_LINE_WIDTH_DEFAULT)
         self.edge_swirl = settings.get("edge_swirl", False)
         self.lighting_mode = settings.get("lighting_mode", "border")
         self.lighting_color_mode = settings.get("lighting_color_mode", "artwork")
+        self.disco_light_style = settings.get("disco_light_style", "glow")
+        self.disco_wire_color = settings.get("disco_wire_color", "green")
         self.disco_light_count = settings.get("disco_light_count", DISCO_LIGHT_COUNT_DEFAULT)
         self.disco_light_size = settings.get("disco_light_size", DISCO_LIGHT_SIZE_DEFAULT)
         self.edge_swirl_direction = settings.get("edge_swirl_direction", "clockwise")
@@ -725,6 +805,7 @@ class AmbiBeatBackend:
         self.album_art_opacity = settings.get("album_art_opacity", ALBUM_ART_OPACITY_DEFAULT)
         self.artwork_mode = settings.get("artwork_mode", "album")
         self.selected_source = settings.get("selected_source", "")
+        self.last_source_instances = settings.get("last_source_instances", {})
         self.running = True
         self._stopped = False
         self._capture_lock = threading.Lock()
@@ -737,6 +818,10 @@ class AmbiBeatBackend:
             self.boost_warning = f"Source volume could not be restored: {error}"
             print(self.boost_warning, flush=True)
         self._refresh_mpris_players()
+        if self.selected_source and self.selected_source == settings.get("selected_source"):
+            player = self._mpris_players.get(self.selected_source.removeprefix("mpris:"))
+            if player:
+                self.last_source_instances.setdefault(player["application"], self.selected_source)
         self._refresh_system_volume()
         self._timer_ids = [
             GLib.timeout_add_seconds(3, self._refresh_mpris_players),
@@ -828,6 +913,31 @@ class AmbiBeatBackend:
     def acknowledge_photosensitivity_warning(self):
         self.set_show_photosensitivity_warning(False)
 
+    def set_source_prompt_seconds(self, seconds):
+        if (not isinstance(seconds, int) or isinstance(seconds, bool)
+                or not SOURCE_PROMPT_SECONDS_MIN <= seconds <= SOURCE_PROMPT_SECONDS_MAX):
+            return False
+        previous = self.source_prompt_seconds
+        self.source_prompt_seconds = seconds
+        try:
+            self._save_settings()
+        except OSError:
+            self.source_prompt_seconds = previous
+            raise
+        return True
+
+    def set_source_prompt_enabled(self, enabled):
+        if not isinstance(enabled, bool):
+            return False
+        previous = self.source_prompt_enabled
+        self.source_prompt_enabled = enabled
+        try:
+            self._save_settings()
+        except OSError:
+            self.source_prompt_enabled = previous
+            raise
+        return True
+
     def set_show_photosensitivity_warning(self, show):
         if not isinstance(show, bool):
             return False
@@ -844,10 +954,13 @@ class AmbiBeatBackend:
     def update_setting(self, name, value, source_id=None):
         setters = {
             "sample-rate": self.set_sample_rate,
+            "source-prompt-seconds": self.set_source_prompt_seconds,
+            "source-prompt-enabled": self.set_source_prompt_enabled,
             "show-photosensitivity-warning": self.set_show_photosensitivity_warning,
             "system-volume": self.set_system_volume,
             "visualizer-mode": self.set_visualizer_mode,
             "scope-zero-line": self.set_scope_zero_line,
+            "scope-line-width": self.set_scope_line_width,
             "artwork-mode": self.set_artwork_mode,
             "album-art-opacity": self.set_album_art_opacity,
             "lighting-mode": self.set_lighting_mode,
@@ -858,6 +971,8 @@ class AmbiBeatBackend:
             "edge-opacity": self.set_edge_opacity,
             "edge-color-count": self.set_edge_color_count,
             "edge-depth": self.set_edge_depth,
+            "disco-light-style": self.set_disco_light_style,
+            "disco-wire-color": self.set_disco_wire_color,
             "disco-light-count": self.set_disco_light_count,
             "disco-light-size": self.set_disco_light_size,
             "edge-swirl-slowdown": self.set_edge_swirl_slowdown,
@@ -1039,6 +1154,43 @@ class AmbiBeatBackend:
             raise
         return True
 
+    def set_scope_line_width(self, width):
+        if (not isinstance(width, int) or isinstance(width, bool)
+                or not SCOPE_LINE_WIDTH_MIN <= width <= SCOPE_LINE_WIDTH_MAX):
+            return False
+        previous = self.scope_line_width
+        self.scope_line_width = width
+        try:
+            self._save_settings()
+        except OSError:
+            self.scope_line_width = previous
+            raise
+        return True
+
+    def set_disco_light_style(self, style):
+        if style not in DISCO_LIGHT_STYLES:
+            return False
+        previous = self.disco_light_style
+        self.disco_light_style = style
+        try:
+            self._save_settings()
+        except OSError:
+            self.disco_light_style = previous
+            raise
+        return True
+
+    def set_disco_wire_color(self, color):
+        if color not in DISCO_WIRE_COLORS:
+            return False
+        previous = self.disco_wire_color
+        self.disco_wire_color = color
+        try:
+            self._save_settings()
+        except OSError:
+            self.disco_wire_color = previous
+            raise
+        return True
+
     def set_disco_light_count(self, count):
         if (not isinstance(count, int) or isinstance(count, bool)
                 or not DISCO_LIGHT_COUNT_MIN <= count <= DISCO_LIGHT_COUNT_MAX):
@@ -1145,15 +1297,21 @@ class AmbiBeatBackend:
         with self.source_volume.lock:
             _write_app_settings({
                 "sample_rate": self.sample_rate,
+                "source_prompt_seconds": self.source_prompt_seconds,
+                "source_prompt_enabled": self.source_prompt_enabled,
                 "photosensitivity_warning_acknowledged": self.photosensitivity_warning_acknowledged,
                 "source_gains": self.source_volume.gains,
                 "volume_journal": self.source_volume.journal,
                 "selected_source": self.selected_source,
+                "last_source_instances": self.last_source_instances,
                 "visualizer_mode": self.visualizer_mode,
                 "scope_zero_line": self.scope_zero_line,
+                "scope_line_width": self.scope_line_width,
                 "edge_swirl": self.edge_swirl,
                 "lighting_mode": self.lighting_mode,
                 "lighting_color_mode": self.lighting_color_mode,
+                "disco_light_style": self.disco_light_style,
+                "disco_wire_color": self.disco_wire_color,
                 "disco_light_count": self.disco_light_count,
                 "disco_light_size": self.disco_light_size,
                 "edge_swirl_direction": self.edge_swirl_direction,
@@ -1264,10 +1422,14 @@ class AmbiBeatBackend:
                     bus_name, MPRIS_OBJECT_PATH, introspect=False
                 )
                 properties = dbus.Interface(obj, "org.freedesktop.DBus.Properties")
-                identity = str(properties.Get("org.mpris.MediaPlayer2", "Identity"))
+                root_properties = properties.GetAll("org.mpris.MediaPlayer2")
+                identity = str(root_properties.get("Identity", ""))
+                if not identity:
+                    raise ValueError(f"Media player {bus_name} has no identity")
+                desktop_entry = str(root_properties.get("DesktopEntry", ""))
                 player_properties = properties.GetAll(MPRIS_PLAYER_INTERFACE)
                 track, art_url, pid = _mpris_track_info(identity, player_properties)
-            except dbus.DBusException as error:
+            except (dbus.DBusException, ValueError) as error:
                 if bus_name not in self._mpris_errors:
                     print(f"Unable to read media player {bus_name}: {error}", flush=True)
                     self._mpris_errors.add(bus_name)
@@ -1277,6 +1439,8 @@ class AmbiBeatBackend:
                 "id": f"mpris:{bus_name}",
                 "bus_name": bus_name,
                 "identity": identity,
+                "application": _source_application_key(identity),
+                "desktop_entry": desktop_entry,
                 "pid": pid,
                 "track": track,
                 "art_url": art_url,
@@ -1307,9 +1471,12 @@ class AmbiBeatBackend:
                  if player["track"]["status"] == "playing"),
                 None,
             )
-            target = active_player["id"] if active_player else next(
-                (player["id"] for player in players.values()), ""
-            )
+            candidate = active_player or next(iter(players.values()), None)
+            preferred_id = self.last_source_instances.get(candidate["application"]) if candidate else None
+            preferred = players.get(preferred_id.removeprefix("mpris:")) if preferred_id else None
+            if preferred and preferred["application"] == candidate["application"]:
+                candidate = preferred
+            target = candidate["id"] if candidate else ""
             with self.source_volume.lock:
                 try:
                     self.source_volume.restore()
@@ -1360,6 +1527,7 @@ class AmbiBeatBackend:
                     if warning:
                         warnings.append(warning)
         self.selected_source = source_id
+        self.last_source_instances[player["application"]] = source_id
         self._publish_track(player["track"], source_id, player["art_url"])
         if switching:
             warning = self._mpris_control_warning(source_id, "Play")
@@ -1667,10 +1835,19 @@ class AmbiBeatBackend:
 
     def get_state(self):
         track = self.track_info.copy()
+        if track.get("position") is not None and track.get("duration") is not None:
+            if track.get("status") == "playing":
+                elapsed = max(0, time.monotonic() - track["positionUpdatedAt"])
+                track["position"] += int(elapsed * track["playbackRate"] * 1_000_000)
+            track["position"] = min(track["position"], track["duration"])
         selected_source = self.selected_source
         resolved_direction = self._resolved_edge_swirl_direction(track, selected_source)
         sources = [
             {"id": player["id"], "label": player["label"],
+             "identity": player.get("identity", ""),
+             "application": player.get("application", ""),
+             "desktopEntry": player.get("desktop_entry", ""),
+             "lastSelected": self.last_source_instances.get(player.get("application", "")) == player["id"],
              "status": player["track"].get("status", "")}
             for player in sorted(
                 self._mpris_players.values(),
@@ -1682,15 +1859,20 @@ class AmbiBeatBackend:
                 "bars": self.bars,
                 "wave": self.wave,
                 "sampleRate": self.sample_rate,
+                "sourcePromptSeconds": self.source_prompt_seconds,
+                "sourcePromptEnabled": self.source_prompt_enabled,
                 "sampleRates": SAMPLE_RATES,
                 "showPhotosensitivityWarning": not self.photosensitivity_warning_acknowledged,
                 "sourceGains": self.source_volume.gains.copy(),
                 "boostWarning": self.boost_warning,
                 "visualizerMode": self.visualizer_mode,
                 "scopeZeroLine": self.scope_zero_line,
+                "scopeLineWidth": self.scope_line_width,
                 "edgeSwirl": self.edge_swirl,
                 "lightingMode": self.lighting_mode,
                 "lightingColorMode": self.lighting_color_mode,
+                "discoLightStyle": self.disco_light_style,
+                "discoWireColor": self.disco_wire_color,
                 "discoLightCount": self.disco_light_count,
                 "discoLightSize": self.disco_light_size,
                 "edgeSwirlDirection": self.edge_swirl_direction,
@@ -1714,6 +1896,24 @@ class AmbiBeatBackend:
             return
 
         raise RuntimeError("No playback source is selected")
+
+    def seek_track(self, source_id, track_id, position):
+        if (source_id != self.selected_source or not source_id.startswith("mpris:")
+                or not isinstance(position, int) or isinstance(position, bool)):
+            raise ValueError("Playback source or position is no longer valid")
+        track = self.track_info
+        if (not track.get("canSeek") or track.get("trackId") != track_id
+                or not 0 <= position <= track["duration"]):
+            raise ValueError("Track is no longer available for seeking")
+        bus_name = source_id[len("mpris:"):]
+        if bus_name not in self._mpris_players:
+            raise RuntimeError(f"Media player is no longer available: {bus_name}")
+        obj = self.session_bus.get_object(bus_name, MPRIS_OBJECT_PATH, introspect=False)
+        player = dbus.Interface(obj, MPRIS_PLAYER_INTERFACE)
+        player.SetPosition(dbus.ObjectPath(track_id), dbus.Int64(position))
+        if self.selected_source == source_id and self.track_info.get("trackId") == track_id:
+            self.track_info["position"] = position
+            self.track_info["positionUpdatedAt"] = time.monotonic()
 
     def _control_mpris_player(self, source_id, action):
         bus_name = source_id[len("mpris:"):]
