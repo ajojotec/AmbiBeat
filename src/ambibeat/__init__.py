@@ -1,0 +1,1 @@
+"""AmbiBeat music visualiser."""

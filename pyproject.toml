@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ambibeat"
+version = "1.0.0"
+description = "AmbiBeat audio visualiser and tempo-synced edge lighting"
+readme = "README.md"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+classifiers = [
+    "Operating System :: POSix :: Linux",
+]
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24", "PySide6>=6.8"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+ambibeat = "ambibeat.__main__:main"
+ambibeat-qt = "ambibeat.qt_frontend:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+ambibeat = ["assets/*.png", "assets/ATTRIBUTION.txt"]
+
